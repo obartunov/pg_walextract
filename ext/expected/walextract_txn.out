@@ -89,5 +89,18 @@ SELECT count(*) AS open_rows
          0
 (1 row)
 
-DROP TABLE wxx_c, wxx_r, wxx_r_flush, wxx_o, wxx_open;
+-- case 5: an aborted transaction that already mutated the (non-transactional)
+-- mined dictionary -- i.e. did DDL inside the rolled-back transaction -- fails
+-- closed, rather than risk a later relfilenode-reuse mis-decode against the
+-- aborted schema.  A committed statement after the rollback flushes the aborted
+-- catalog records + ABORT so they are actually scanned.
+SELECT pg_current_wal_lsn() AS s5 \gset
+BEGIN;
+CREATE TABLE wxx_abort_ddl (id int);
+ROLLBACK;
+CREATE TABLE wxx_ddl_flush (x int);   -- committed: flushes the aborted DDL + ABORT
+SELECT pg_current_wal_lsn() AS e5 \gset
+SELECT count(*) FROM walextract_wal2sql(:'s5', :'e5');   -- must fail closed (ERROR)
+ERROR:  walextract could not assemble transactions: aborted transaction had already mutated the mined dictionary (non-transactional dictionary cannot be rolled back)
+DROP TABLE wxx_c, wxx_r, wxx_r_flush, wxx_o, wxx_open, wxx_ddl_flush;
 DROP EXTENSION walextract;

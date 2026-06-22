@@ -374,7 +374,19 @@ we_flush_family(WalExtractContext *ctx, TransactionId topxid,
 	}
 }
 
-/* ABORT: drop every buffered event in the family; deliver nothing */
+/*
+ * ABORT: drop every buffered event in the family; deliver nothing.
+ *
+ * Dictionary side effects (relfilenode->relname, column descriptors, TID
+ * identities) are applied immediately at scan time, NOT transactionally, so an
+ * aborted transaction that emitted any DDL_CATALOG event has already mutated
+ * the mined dictionary.  v0 cannot roll those mutations back, and a later
+ * relfilenode reuse could then mis-decode a committed row against the aborted
+ * schema -- silent corruption of the committed stream.  We cannot undo it
+ * safely here, so we fail closed: the frontend turns this into an error rather
+ * than continuing with a poisoned dictionary.  (Production fix: a transactional
+ * dictionary; named blocker, out of scope for v0.)
+ */
 static void
 we_discard_family(WalExtractContext *ctx, TransactionId topxid,
 				  const TransactionId *subxacts, int nsub)
@@ -388,6 +400,9 @@ we_discard_family(WalExtractContext *ctx, TransactionId topxid,
 
 		if (we_xid_in_family(node->ev.xid, topxid, subxacts, nsub))
 		{
+			if (node->ev.op == WCO_DDL_CATALOG)
+				ctx->status = WALEXTRACT_FATAL_ABORTED_DDL;
+
 			if (prev == NULL)
 				ctx->buf_head = next;
 			else
@@ -1681,6 +1696,8 @@ walextract_status_message(const WalExtractContext *ctx)
 			return "out of memory while buffering transaction events";
 		case WALEXTRACT_FATAL_TWOPHASE:
 			return "prepared (two-phase) transaction records are not supported";
+		case WALEXTRACT_FATAL_ABORTED_DDL:
+			return "aborted transaction had already mutated the mined dictionary (non-transactional dictionary cannot be rolled back)";
 	}
 	return "unknown";
 }

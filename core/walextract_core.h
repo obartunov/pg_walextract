@@ -86,7 +86,8 @@ typedef enum WalExtractStatus
 	WALEXTRACT_OK = 0,
 	WALEXTRACT_FATAL_BUFFER_OVERFLOW,	/* per-call buffered-event cap hit */
 	WALEXTRACT_FATAL_OOM,				/* malloc failed while buffering */
-	WALEXTRACT_FATAL_TWOPHASE			/* prepared-xact record: out of scope in v0 */
+	WALEXTRACT_FATAL_TWOPHASE,			/* prepared-xact record: out of scope in v0 */
+	WALEXTRACT_FATAL_ABORTED_DDL		/* aborted txn already mutated the (non-txnal) dictionary */
 } WalExtractStatus;
 
 typedef struct WalExtractContext WalExtractContext;
