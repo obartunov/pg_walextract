@@ -87,12 +87,16 @@ In-server SRF (privileged — see §6):
     SELECT * FROM walextract_wal2sql('<start_lsn>', '<end_lsn>');
 
 SRF columns: `record_lsn, xid, db_oid, rel_oid, relfilenode, op, relation,
-complete, reasons text[], op_text`.
+complete, reasons text[], op_text, commit_lsn`.  `commit_lsn` is the LSN of the
+COMMIT record that released the event (see §7); it is set on every delivered
+event because events are delivered only at COMMIT.
 
 ## 5. Tests
 
 `ext/sql/walextract.sql` (`pg_regress`, expected in `ext/expected/`) is the
-smoke contract; `REGRESS = walextract` is wired in `ext/Makefile`:
+smoke contract; `ext/sql/walextract_txn.sql` is the transaction-assembler
+contract; both are wired via `REGRESS = walextract walextract_txn` in
+`ext/Makefile`:
 
     cd ext && PG_CONFIG=/path/to/pg_config \
       PGHOST=/tmp PGPORT=5444 PGUSER=postgres make installcheck
@@ -106,6 +110,13 @@ no mined descriptor -> `complete=false`, `dictionary_missing`; every
 inserting tuple xmin; and a round-trip of the complete op_text reproduces the
 original rows.
 
+`walextract_txn.sql` asserts the transaction boundary: a committed INSERT
+appears only with `commit_lsn` set (after its data record, within range); an
+INSERT then ROLLBACK is not emitted; two INSERTs in one transaction are
+delivered in WAL order sharing one `commit_lsn`; a transaction still open at the
+range end is not emitted; and an ABORT of a transaction that did DDL fails
+closed (§7).
+
 ## 6. Privilege
 
 `walextract_wal2sql()` reconstructs user table data from WAL, so it is
@@ -115,9 +126,27 @@ from PUBLIC and grants it to `pg_read_server_files`.
 
 ## 7. Not production / not in scope
 
-- **Commit order, abort, subxact are NOT handled.** Events are physical WAL
-  records in WAL order; `commit_lsn` is always Invalid. A `TxAssembler` is the
-  next task and is required before any apply path.
+- **TxAssembler v0 solves transaction *end*, not transaction *start*.** Events
+  are buffered by xid and delivered only on the top-level `COMMIT` record
+  observed inside the scanned range, in WAL order, with `commit_lsn` set;
+  `ABORT` discards the family; transactions still open at the end of the range
+  are not emitted. Subtransactions are flushed/discarded via the commit/abort
+  record's own subxact list (no savepoint model).
+- **Output is NOT apply-safe for an arbitrary `start_lsn`.** If `start_lsn`
+  falls inside an already-running transaction, only its tail is observed; on
+  `COMMIT` that tail is emitted as a committed *fragment*. That is correct for
+  "we saw COMMIT for the buffered fragment" but is a partial transaction for an
+  apply stream. Apply-safe consumption requires a proven safe transaction
+  boundary or a future open-transaction-state / checkpoint mechanism
+  (RangeStartSafety / WalStreamCheckpoint), which v0 does not provide.
+- **Fail-closed guards (dev guards, not final policy).** Prepared (two-phase)
+  xact records, and an `ABORT` of a transaction that already mutated the
+  *non-transactional* mined dictionary via DDL, both fail closed (the SRF
+  errors) rather than risk a partial or mis-decoded result. A transactional
+  dictionary overlay is a separate future layer.
+- **Binary frontend is diagnostic / non-atomic.** `pg_walextract` prints
+  delivered events but emits no framed, atomic per-transaction output; it is not
+  an apply source until a framed output format exists.
 - DDL is reported as a catalog effect, not reconstructed original SQL.
 - UPDATE/DELETE of user tables are not decoded (catalog UPDATE/DELETE only).
 - TOAST values are not reassembled; toasted columns are marked, not recovered.
@@ -130,7 +159,11 @@ from PUBLIC and grants it to `pg_read_server_files`.
 
 ProGate / ProCopy must consume the structured `ChangeEvent` payload (filtered by
 `db_oid`/`rel_oid`, gated on `complete`, honoring `reasons`), not the `op_text`
-string.
+string. Two stream contracts apply: an **apply stream** must be committed,
+complete, and safe-start proven; a **forensic stream** may expose
+physical/open/aborted events but must always mark them explicitly. v0 delivers
+the forensic shape (committed events observed within the range); the apply shape
+additionally requires the range-start safety named above.
 
 ## 8. Build / packaging
 
@@ -150,3 +183,5 @@ rule, so the package builds with the `core/` + `ext/` layout as shipped.
     ext/Makefile                   PGXS packaging (no hardcoded PG_CONFIG)
     ext/sql/walextract.sql,
     ext/expected/walextract.out    smoke contract + expected output
+    ext/sql/walextract_txn.sql,
+    ext/expected/walextract_txn.out  transaction-assembler contract + expected
