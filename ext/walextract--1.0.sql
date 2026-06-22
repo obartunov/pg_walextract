@@ -3,7 +3,7 @@
 CREATE FUNCTION walextract_wal2sql(start_lsn pg_lsn, end_lsn pg_lsn)
 RETURNS TABLE(record_lsn pg_lsn, xid xid, db_oid oid, rel_oid oid,
               relfilenode oid, op text, relation text, complete boolean,
-              reasons text[], op_text text)
+              reasons text[], op_text text, commit_lsn pg_lsn)
 AS 'MODULE_PATHNAME', 'walextract_wal2sql'
 LANGUAGE C STRICT PARALLEL UNSAFE;
 

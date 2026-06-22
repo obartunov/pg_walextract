@@ -73,6 +73,22 @@ typedef struct ChangeEvent
 	ChangeColumn cols[WALEXTRACT_MAX_COLS];
 } ChangeEvent;
 
+/*
+ * Transaction-assembler status.  The miner buffers physical ChangeEvents by
+ * xid and only emits a transaction's events on its COMMIT record; it must
+ * never expose an aborted or still-open transaction as committed.  When the
+ * assembler cannot uphold that contract it fails closed: it stops emitting and
+ * records a fatal status here, which the frontend must check (walextract_failed)
+ * and surface as an error instead of returning partial/uncommitted output.
+ */
+typedef enum WalExtractStatus
+{
+	WALEXTRACT_OK = 0,
+	WALEXTRACT_FATAL_BUFFER_OVERFLOW,	/* per-call buffered-event cap hit */
+	WALEXTRACT_FATAL_OOM,				/* malloc failed while buffering */
+	WALEXTRACT_FATAL_TWOPHASE			/* prepared-xact record: out of scope in v0 */
+} WalExtractStatus;
+
 typedef struct WalExtractContext WalExtractContext;
 typedef void (*WalExtractEmit) (const ChangeEvent *ev, void *sink);
 
@@ -89,5 +105,10 @@ extern void walextract_set_target_db(WalExtractContext *ctx, Oid dboid);
 extern void walextract_record(WalExtractContext *ctx, XLogReaderState *record);
 
 extern const char *walextract_op_name(WalChangeOp op);
+
+/* transaction-assembler fatal status (fail-closed); see WalExtractStatus */
+extern bool walextract_failed(const WalExtractContext *ctx);
+extern WalExtractStatus walextract_status(const WalExtractContext *ctx);
+extern const char *walextract_status_message(const WalExtractContext *ctx);
 
 #endif							/* WALEXTRACT_CORE_H */

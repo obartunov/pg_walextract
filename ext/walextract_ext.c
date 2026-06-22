@@ -32,8 +32,8 @@ static void
 sink_emit(const ChangeEvent *ev, void *sink)
 {
 	SinkCtx    *s = (SinkCtx *) sink;
-	Datum		values[10];
-	bool		nulls[10];
+	Datum		values[11];
+	bool		nulls[11];
 	int			i;
 
 	memset(nulls, 0, sizeof(nulls));
@@ -60,6 +60,10 @@ sink_emit(const ChangeEvent *ev, void *sink)
 	else
 		nulls[8] = true;
 	values[9] = CStringGetTextDatum(ev->op_text);
+	if (ev->commit_lsn == InvalidXLogRecPtr)
+		nulls[10] = true;		/* not delivered via a COMMIT (should not happen) */
+	else
+		values[10] = LSNGetDatum(ev->commit_lsn);
 	tuplestore_putvalues(s->tupstore, s->tupdesc, values, nulls);
 }
 
@@ -180,6 +184,25 @@ walextract_wal2sql(PG_FUNCTION_ARGS)
 	{
 		CHECK_FOR_INTERRUPTS();
 		walextract_record(wectx, xlogreader);
+		if (walextract_failed(wectx))
+			break;
+	}
+
+	/*
+	 * Fail closed: if the transaction assembler could not uphold its contract
+	 * (buffer cap, OOM, or a prepared-xact record), do not return a partial or
+	 * possibly-uncommitted result set; raise an error instead.
+	 */
+	if (walextract_failed(wectx))
+	{
+		const char *msg = walextract_status_message(wectx);
+
+		pfree(xlogreader->private_data);
+		XLogReaderFree(xlogreader);
+		walextract_context_free(wectx);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("walextract could not assemble transactions: %s", msg)));
 	}
 
 	pfree(xlogreader->private_data);

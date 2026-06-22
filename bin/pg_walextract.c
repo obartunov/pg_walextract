@@ -46,7 +46,8 @@ walextract_print_event(const ChangeEvent *ev, void *sink)
 	rb[0] = '\0';
 	for (i = 0; i < ev->nreasons; i++)
 		o += snprintf(rb + o, sizeof(rb) - o, "%s%s", i ? "," : "", ev->reasons[i]);
-	printf("%-11s [%s%s%s]%s%s | %s\n",
+	printf("commit %X/%08X %-11s [%s%s%s]%s%s | %s\n",
+		   LSN_FORMAT_ARGS(ev->commit_lsn),
 		   walextract_op_name(ev->op),
 		   ev->complete ? "complete" : "incomplete",
 		   ev->nreasons ? ":" : "", rb,
@@ -1592,6 +1593,14 @@ main(int argc, char **argv)
 		pg_fatal("error in WAL record at %X/%08X: %s",
 				 LSN_FORMAT_ARGS(xlogreader_state->ReadRecPtr),
 				 errormsg);
+
+	/*
+	 * Fail closed: if the transaction assembler could not uphold its contract
+	 * over this range, do not exit cleanly with partial/uncommitted output.
+	 */
+	if (wectx != NULL && walextract_failed(wectx))
+		pg_fatal("walextract could not assemble transactions: %s",
+				 walextract_status_message(wectx));
 
 	/*
 	 * Disarm atexit cleanup of open WAL file; XLogReaderFree will close it,

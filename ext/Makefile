@@ -3,7 +3,7 @@ OBJS = walextract_ext.o walextract_core.o
 EXTENSION = walextract
 DATA = walextract--1.0.sql
 PGFILEDESC = "walextract - mine DDL/DML effects from WAL"
-REGRESS = walextract
+REGRESS = walextract walextract_txn
 
 # Core source lives in ../core (sibling dir in the distributed package).
 # No hardcoded PG_CONFIG: override via command line or environment.

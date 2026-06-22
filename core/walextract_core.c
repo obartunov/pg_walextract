@@ -9,6 +9,7 @@
 #include "postgres.h"
 
 #include "access/transam.h"
+#include "access/xact.h"
 #include "access/xlogreader.h"
 #include "access/rmgr.h"
 #include "access/heapam_xlog.h"
@@ -82,6 +83,43 @@ typedef struct MineRelDesc
 } MineRelDesc;
 #define MINE_NDESC 1024
 
+/*
+ * ---- transaction assembler: per-xid buffered physical ChangeEvents ----
+ *
+ * A WAL record is not a committed change.  The decoder produces physical
+ * ChangeEvents in WAL order; they are buffered here keyed by the record xid and
+ * delivered to the emit sink only when the owning transaction's COMMIT record
+ * is seen, in their original within-transaction WAL order.  ABORT discards the
+ * buffer; transactions still open at the end of the scanned range are never
+ * delivered.
+ *
+ * Each buffered node owns deep copies of every transient string the ChangeEvent
+ * points at (op_text, relname, per-column attname/value_text), because those
+ * live in caller stack / WAL-record buffers that are reused on the next record.
+ * The in-tuple raw datum (cols[].raw_ptr) is the one field that genuinely
+ * cannot survive deferral; it is documented emit-callback-only and is set NULL
+ * (raw_len 0) on buffered nodes.
+ *
+ * Buffering is bounded by a per-call event-count cap and a byte cap
+ * (WALEXTRACT_MAX_BUFFERED / _BYTES).  These are dev-guard caps, not a true
+ * memory-bounded spill framework (out of scope for v0).  Hitting either cap, or
+ * a malloc failure, fails closed: the assembler stops and records a fatal
+ * status; the frontend turns that into an error rather than emitting
+ * partial/uncommitted output.
+ */
+#define WALEXTRACT_MAX_BUFFERED 1048576		/* live buffered events per call */
+#define WALEXTRACT_MAX_BUFFERED_BYTES (256 * 1024 * 1024)	/* live buffered bytes */
+
+typedef struct WeBufEvent
+{
+	struct WeBufEvent *next;
+	size_t		bytes;			/* size of this single allocation (node + packed strings) */
+	ChangeEvent ev;				/* structured event; string pointers rewired into the
+								 * trailing region of this same allocation.  op_text is
+								 * NOT stored for the typed (INSERT) hot path: it is a
+								 * downstream formatter product rendered at delivery. */
+} WeBufEvent;
+
 /* ---- explicit context: all mutable decoder state ---- */
 struct WalExtractContext
 {
@@ -108,6 +146,13 @@ struct WalExtractContext
 	MineDictEnt dict[MINE_DICT_SZ];
 	MineRelMapEnt relfile[MINE_NREL];
 	MineRelDesc desc[MINE_NDESC];
+
+	/* transaction assembler: WAL-order list of buffered, not-yet-committed events */
+	WeBufEvent *buf_head;
+	WeBufEvent *buf_tail;
+	int			buf_nlive;		/* number of buffered events not yet flushed */
+	Size		buf_bytes;		/* total bytes held by the buffer (cap accounting) */
+	WalExtractStatus status;	/* fail-closed status (WALEXTRACT_OK = healthy) */
 };
 
 /* ===================== small helpers ===================== */
@@ -130,11 +175,250 @@ walextract_op_name(WalChangeOp op)
 	}
 }
 
+/* op_text is a downstream formatter product, never assembler state for the
+ * typed hot path; rendered at delivery from the structured event (pure fn). */
+static bool mine_format_insert(const ChangeEvent *ev, char *buf, size_t cap);
+
+/*
+ * Deliver one assembled event to the sink.  This is the only place the SQL-text
+ * formatter runs for INSERTs: the assembler buffers the structured ChangeEvent
+ * (typed columns), and op_text is produced here -- downstream of all
+ * correctness logic -- into a delivery-local buffer that is valid for the
+ * duration of the callback.  DDL_CATALOG events have no typed payload in v0, so
+ * their effect text is the event's only content and is carried verbatim
+ * (op_text already set) rather than re-rendered.
+ */
+static void
+we_deliver(WalExtractContext *ctx, ChangeEvent *ev)
+{
+	char		op_text[8192];
+
+	if (ctx->emit_cb == NULL)
+		return;
+	if (ev->op == WCO_INSERT)
+	{
+		mine_format_insert(ev, op_text, sizeof(op_text));
+		ev->op_text = op_text;
+	}
+	ctx->emit_cb(ev, ctx->emit_sink);
+}
+
+/* bytes needed to copy s including its NUL (0 if NULL) */
+static size_t
+we_strspan(const char *s)
+{
+	return s ? strlen(s) + 1 : 0;
+}
+
+/* copy s into *cursor (if non-NULL), advance the cursor, return the copy */
+static const char *
+we_pack(char **cursor, const char *s)
+{
+	char	   *dst;
+	size_t		n;
+
+	if (s == NULL)
+		return NULL;
+	n = strlen(s) + 1;
+	dst = *cursor;
+	memcpy(dst, s, n);
+	*cursor += n;
+	return dst;
+}
+
+/* drop one node from the buffer accounting and free its single allocation */
+static void
+we_node_free(WalExtractContext *ctx, WeBufEvent *node)
+{
+	ctx->buf_bytes -= node->bytes;
+	ctx->buf_nlive--;
+	free(node);
+}
+
+/*
+ * Capture (buffer) a physical ChangeEvent until its transaction commits.
+ *
+ * The assembler buffers the STRUCTURED event, not SQL text.  Everything the
+ * event needs to be reconstructed after deferral is copied into ONE allocation
+ * per event (node + a trailing string region), keeping copying explicit and
+ * local so it can later be replaced by a per-call arena / batch storage.  The
+ * in-tuple raw datum (raw_ptr) is dropped (emit-callback-only by contract).
+ * op_text is NOT copied for INSERTs -- it is re-rendered downstream at delivery
+ * (we_deliver); only DDL_CATALOG, which has no typed payload in v0, carries its
+ * effect text.
+ *
+ * Buffering is bounded by a per-call event cap and byte cap.  Hitting either
+ * cap, or a malloc failure, fails closed: the assembler sets a fatal status and
+ * delivers nothing further; the frontend turns that into an error rather than
+ * emitting partial/uncommitted output.
+ */
 static void
 we_emit_event(WalExtractContext *ctx, ChangeEvent *ev)
 {
-	if (ctx->emit_cb)
-		ctx->emit_cb(ev, ctx->emit_sink);
+	bool		store_op_text = (ev->op != WCO_INSERT);
+	size_t		strbytes = 0;
+	size_t		total;
+	int			i;
+	WeBufEvent *node;
+	char	   *cursor;
+
+	if (ctx->status != WALEXTRACT_OK)
+		return;					/* already failed closed: emit nothing further */
+
+	if (ctx->buf_nlive >= WALEXTRACT_MAX_BUFFERED)
+	{
+		ctx->status = WALEXTRACT_FATAL_BUFFER_OVERFLOW;
+		return;
+	}
+
+	/* size the single per-event allocation */
+	strbytes += we_strspan(ev->relname);
+	if (store_op_text)
+		strbytes += we_strspan(ev->op_text);
+	for (i = 0; i < ev->ncols; i++)
+	{
+		strbytes += we_strspan(ev->cols[i].attname);
+		strbytes += we_strspan(ev->cols[i].value_text);
+	}
+	total = sizeof(WeBufEvent) + strbytes;
+
+	if (ctx->buf_bytes + total > (Size) WALEXTRACT_MAX_BUFFERED_BYTES)
+	{
+		ctx->status = WALEXTRACT_FATAL_BUFFER_OVERFLOW;
+		return;
+	}
+
+	node = (WeBufEvent *) malloc(total);
+	if (node == NULL)
+	{
+		ctx->status = WALEXTRACT_FATAL_OOM;
+		return;
+	}
+	node->next = NULL;
+	node->bytes = total;
+	node->ev = *ev;				/* scalars + static reason pointers copied here */
+	cursor = (char *) (node + 1);
+
+	/* rewire string pointers into this node's own trailing region */
+	node->ev.relname = we_pack(&cursor, ev->relname);
+	node->ev.schema_name = NULL;	/* not resolved in v0 */
+	node->ev.op_text = store_op_text ? we_pack(&cursor, ev->op_text) : NULL;
+	for (i = 0; i < ev->ncols; i++)
+	{
+		node->ev.cols[i].attname = we_pack(&cursor, ev->cols[i].attname);
+		node->ev.cols[i].value_text = we_pack(&cursor, ev->cols[i].value_text);
+		node->ev.cols[i].raw_ptr = NULL;	/* in-tuple datum cannot survive deferral */
+		node->ev.cols[i].raw_len = 0;
+	}
+
+	/* append in WAL order */
+	if (ctx->buf_tail == NULL)
+		ctx->buf_head = ctx->buf_tail = node;
+	else
+	{
+		ctx->buf_tail->next = node;
+		ctx->buf_tail = node;
+	}
+	ctx->buf_nlive++;
+	ctx->buf_bytes += total;
+}
+
+/* is xid the transaction or one of its committed/aborted subxacts? */
+static bool
+we_xid_in_family(TransactionId xid, TransactionId topxid,
+				 const TransactionId *subxacts, int nsub)
+{
+	int			i;
+
+	if (xid == topxid)
+		return true;
+	for (i = 0; i < nsub; i++)
+		if (xid == subxacts[i])
+			return true;
+	return false;
+}
+
+/*
+ * COMMIT: deliver every buffered event whose xid is in {topxid} U subxacts,
+ * in WAL order, with commit_lsn set; then drop those nodes.  Walking the single
+ * WAL-order list preserves within-transaction order across subtransactions.
+ */
+static void
+we_flush_family(WalExtractContext *ctx, TransactionId topxid,
+				const TransactionId *subxacts, int nsub, XLogRecPtr commit_lsn)
+{
+	WeBufEvent *node = ctx->buf_head;
+	WeBufEvent *prev = NULL;
+
+	while (node != NULL)
+	{
+		WeBufEvent *next = node->next;
+
+		if (we_xid_in_family(node->ev.xid, topxid, subxacts, nsub))
+		{
+			node->ev.commit_lsn = commit_lsn;
+			we_deliver(ctx, &node->ev);
+
+			if (prev == NULL)
+				ctx->buf_head = next;
+			else
+				prev->next = next;
+			if (ctx->buf_tail == node)
+				ctx->buf_tail = prev;
+
+			we_node_free(ctx, node);
+		}
+		else
+			prev = node;
+		node = next;
+	}
+}
+
+/* ABORT: drop every buffered event in the family; deliver nothing */
+static void
+we_discard_family(WalExtractContext *ctx, TransactionId topxid,
+				  const TransactionId *subxacts, int nsub)
+{
+	WeBufEvent *node = ctx->buf_head;
+	WeBufEvent *prev = NULL;
+
+	while (node != NULL)
+	{
+		WeBufEvent *next = node->next;
+
+		if (we_xid_in_family(node->ev.xid, topxid, subxacts, nsub))
+		{
+			if (prev == NULL)
+				ctx->buf_head = next;
+			else
+				prev->next = next;
+			if (ctx->buf_tail == node)
+				ctx->buf_tail = prev;
+
+			we_node_free(ctx, node);
+		}
+		else
+			prev = node;
+		node = next;
+	}
+}
+
+/* free all still-buffered (open at range end / fatal) events without delivery */
+static void
+we_buf_free_all(WalExtractContext *ctx)
+{
+	WeBufEvent *node = ctx->buf_head;
+
+	while (node != NULL)
+	{
+		WeBufEvent *next = node->next;
+
+		free(node);
+		node = next;
+	}
+	ctx->buf_head = ctx->buf_tail = NULL;
+	ctx->buf_nlive = 0;
+	ctx->buf_bytes = 0;
 }
 
 static void
@@ -1020,6 +1304,56 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 	BlockNumber blk;
 	Size		datalen;
 
+	if (ctx->status != WALEXTRACT_OK)
+		return;					/* failed closed: stop processing */
+
+	/*
+	 * Transaction boundary: a COMMIT delivers the transaction's buffered
+	 * events (with commit_lsn) in WAL order; an ABORT discards them.  Both use
+	 * the record's own authoritative subxact list, so subtransaction children
+	 * are flushed/discarded with their parent without a separate savepoint
+	 * model.  Prepared (2PC) records are out of scope in v0 and fail closed.
+	 */
+	if (rmid == RM_XACT_ID)
+	{
+		uint8		xact_info = XLogRecGetInfo(record);
+		uint8		xact_op = xact_info & XLOG_XACT_OPMASK;
+		TransactionId topxid = XLogRecGetXid(record);
+
+		if (xact_op == XLOG_XACT_COMMIT)
+		{
+			xl_xact_commit *xlrec = (xl_xact_commit *) XLogRecGetData(record);
+			xl_xact_parsed_commit parsed;
+
+			ParseCommitRecord(xact_info, xlrec, &parsed);
+			we_flush_family(ctx, topxid, parsed.subxacts, parsed.nsubxacts,
+							record->ReadRecPtr);
+		}
+		else if (xact_op == XLOG_XACT_ABORT)
+		{
+			xl_xact_abort *xlrec = (xl_xact_abort *) XLogRecGetData(record);
+			xl_xact_parsed_abort parsed;
+
+			ParseAbortRecord(xact_info, xlrec, &parsed);
+			we_discard_family(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
+		}
+		else if (xact_op == XLOG_XACT_PREPARE ||
+				 xact_op == XLOG_XACT_COMMIT_PREPARED ||
+				 xact_op == XLOG_XACT_ABORT_PREPARED)
+		{
+			/*
+			 * Prepared transactions split the boundary across PREPARE and a
+			 * later COMMIT/ABORT PREPARED whose family root is the parsed
+			 * twophase_xid, not the record xid.  Tracking that correctly is a
+			 * policy decision deferred past v0; mishandling it would either
+			 * drop committed data or misroute a family, so fail closed.
+			 */
+			ctx->status = WALEXTRACT_FATAL_TWOPHASE;
+		}
+		/* ASSIGNMENT / INVALIDATIONS / others: not tx boundaries -> ignore */
+		return;
+	}
+
 	if (rmid != RM_HEAP_ID && rmid != RM_HEAP2_ID)
 		return;
 	if (!XLogRecGetBlockTagExtended(record, 0, &rloc, &forknum, &blk, NULL))
@@ -1261,7 +1595,10 @@ void
 walextract_context_free(WalExtractContext *ctx)
 {
 	if (ctx)
+	{
+		we_buf_free_all(ctx);
 		free(ctx);
+	}
 }
 
 void
@@ -1273,6 +1610,7 @@ walextract_context_reset(WalExtractContext *ctx)
 	Oid			tdb = ctx->target_db;
 	char		pg[1024];
 
+	we_buf_free_all(ctx);		/* drop any open-transaction buffer first */
 	strlcpy(pg, ctx->pgdata, sizeof(pg));
 	memset(ctx, 0, sizeof(*ctx));
 	ctx->emit_cb = cb;
@@ -1314,4 +1652,35 @@ void
 walextract_set_target_db(WalExtractContext *ctx, Oid dboid)
 {
 	ctx->target_db = dboid;
+}
+
+/* ===================== assembler status (fail-closed) ===================== */
+
+bool
+walextract_failed(const WalExtractContext *ctx)
+{
+	return ctx->status != WALEXTRACT_OK;
+}
+
+WalExtractStatus
+walextract_status(const WalExtractContext *ctx)
+{
+	return ctx->status;
+}
+
+const char *
+walextract_status_message(const WalExtractContext *ctx)
+{
+	switch (ctx->status)
+	{
+		case WALEXTRACT_OK:
+			return "ok";
+		case WALEXTRACT_FATAL_BUFFER_OVERFLOW:
+			return "transaction buffer overflow: too many uncommitted events buffered";
+		case WALEXTRACT_FATAL_OOM:
+			return "out of memory while buffering transaction events";
+		case WALEXTRACT_FATAL_TWOPHASE:
+			return "prepared (two-phase) transaction records are not supported";
+	}
+	return "unknown";
 }
