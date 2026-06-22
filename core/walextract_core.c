@@ -153,6 +153,7 @@ struct WalExtractContext
 	int			buf_nlive;		/* number of buffered events not yet flushed */
 	Size		buf_bytes;		/* total bytes held by the buffer (cap accounting) */
 	WalExtractStatus status;	/* fail-closed status (WALEXTRACT_OK = healthy) */
+	WalExtractRenderMode render_mode;	/* WX_RENDER_SQL (default) / WX_RENDER_EVENT */
 };
 
 /* ===================== small helpers ===================== */
@@ -195,7 +196,7 @@ we_deliver(WalExtractContext *ctx, ChangeEvent *ev)
 
 	if (ctx->emit_cb == NULL)
 		return;
-	if (ev->op == WCO_INSERT)
+	if (ctx->render_mode == WX_RENDER_SQL && ev->op == WCO_INSERT)
 	{
 		mine_format_insert(ev, op_text, sizeof(op_text));
 		ev->op_text = op_text;
@@ -226,6 +227,20 @@ we_pack(char **cursor, const char *s)
 	return dst;
 }
 
+/* copy len raw bytes into *cursor (if any), advance, return the copy */
+static const char *
+we_pack_raw(char **cursor, const char *p, Size len)
+{
+	char	   *dst;
+
+	if (p == NULL || len == 0)
+		return NULL;
+	dst = *cursor;
+	memcpy(dst, p, len);
+	*cursor += len;
+	return dst;
+}
+
 /* drop one node from the buffer accounting and free its single allocation */
 static void
 we_node_free(WalExtractContext *ctx, WeBufEvent *node)
@@ -241,11 +256,17 @@ we_node_free(WalExtractContext *ctx, WeBufEvent *node)
  * The assembler buffers the STRUCTURED event, not SQL text.  Everything the
  * event needs to be reconstructed after deferral is copied into ONE allocation
  * per event (node + a trailing string region), keeping copying explicit and
- * local so it can later be replaced by a per-call arena / batch storage.  The
- * in-tuple raw datum (raw_ptr) is dropped (emit-callback-only by contract).
- * op_text is NOT copied for INSERTs -- it is re-rendered downstream at delivery
- * (we_deliver); only DDL_CATALOG, which has no typed payload in v0, carries its
- * effect text.
+ * local so it can later be replaced by a per-call arena / batch storage.
+ *
+ * Per-column payload depends on render mode:
+ *   SQL mode (WX_RENDER_SQL): the in-tuple raw datum (raw_ptr) is dropped
+ *     (emit-callback-only by contract) and the rendered value_text is copied;
+ *     INSERT op_text is NOT copied -- it is re-rendered downstream at delivery
+ *     (we_deliver).
+ *   EVENT mode (WX_RENDER_EVENT): value_text is NULL and the raw value bytes are
+ *     copied into this node's owned packed storage, with raw_ptr repointed there;
+ *     no SQL is rendered.
+ * DDL_CATALOG (either mode) has no typed payload in v0 and carries its effect text.
  *
  * Buffering is bounded by a per-call event cap and byte cap.  Hitting either
  * cap, or a malloc failure, fails closed: the assembler sets a fatal status and
@@ -278,7 +299,10 @@ we_emit_event(WalExtractContext *ctx, ChangeEvent *ev)
 	for (i = 0; i < ev->ncols; i++)
 	{
 		strbytes += we_strspan(ev->cols[i].attname);
-		strbytes += we_strspan(ev->cols[i].value_text);
+		if (ctx->render_mode == WX_RENDER_EVENT)
+			strbytes += ev->cols[i].raw_len;	/* raw payload survives buffering */
+		else
+			strbytes += we_strspan(ev->cols[i].value_text);
 	}
 	total = sizeof(WeBufEvent) + strbytes;
 
@@ -306,9 +330,22 @@ we_emit_event(WalExtractContext *ctx, ChangeEvent *ev)
 	for (i = 0; i < ev->ncols; i++)
 	{
 		node->ev.cols[i].attname = we_pack(&cursor, ev->cols[i].attname);
-		node->ev.cols[i].value_text = we_pack(&cursor, ev->cols[i].value_text);
-		node->ev.cols[i].raw_ptr = NULL;	/* in-tuple datum cannot survive deferral */
-		node->ev.cols[i].raw_len = 0;
+		if (ctx->render_mode == WX_RENDER_EVENT)
+		{
+			/* event mode: preserve raw typed payload; repoint into packed store */
+			node->ev.cols[i].value_text = NULL;
+			node->ev.cols[i].raw_ptr = we_pack_raw(&cursor, ev->cols[i].raw_ptr,
+												   ev->cols[i].raw_len);
+			/* raw_len carried over from *ev (scalar); keep it consistent with ptr */
+			if (node->ev.cols[i].raw_ptr == NULL)
+				node->ev.cols[i].raw_len = 0;
+		}
+		else
+		{
+			node->ev.cols[i].value_text = we_pack(&cursor, ev->cols[i].value_text);
+			node->ev.cols[i].raw_ptr = NULL;	/* SQL mode keeps rendered text only */
+			node->ev.cols[i].raw_len = 0;
+		}
 	}
 
 	/* append in WAL order */
@@ -1057,13 +1094,36 @@ mine_decode_dml(WalExtractContext *ctx, HeapTupleHeader htup, RelFileLocator *rl
 
 				if (!isnull)
 				{
-					/*
-					 * Bounded per-column rendering.  If valstore is exhausted we
-					 * must NOT render or point value_text past the buffer: fall
-					 * back to a static placeholder and mark the value truncated.
-					 */
-					if (valpos >= sizeof(valstore) - 1)
+					/* raw typed refs captured in both modes (for event payload
+					 * buffering and for SQL/debug rendering of raw_len). */
+					cc->raw_ptr = vptr;
+					if (c->attlen == -1)
+						cc->raw_len = VARSIZE_ANY(vptr);
+					else if (c->attlen == -2)
+						cc->raw_len = strlen(vptr) + 1;
+					else
+						cc->raw_len = (Size) c->attlen;
+
+					if (ctx->render_mode == WX_RENDER_EVENT)
 					{
+						/*
+						 * Event mode (product path): keep raw typed payload, do
+						 * NOT build a SQL literal.  complete is raw-payload
+						 * relative: only an external TOAST pointer means the value
+						 * is not present in this WAL record.  unknown_type and
+						 * value_truncated are SQL-renderer reasons and do not apply.
+						 */
+						if (c->attlen == -1 && VARATT_IS_EXTERNAL(vptr))
+						{
+							cc->complete = false;
+							cc->reason = WER_TOAST_EXTERNAL;
+							ev.complete = false;
+							ev_add_reason(&ev, WER_TOAST_EXTERNAL);
+						}
+					}
+					else if (valpos >= sizeof(valstore) - 1)
+					{
+						/* SQL mode: render buffer exhausted -> value_truncated. */
 						cc->value_text = "NULL";
 						cc->complete = false;
 						cc->reason = WER_VALUE_TRUNCATED;
@@ -1072,6 +1132,7 @@ mine_decode_dml(WalExtractContext *ctx, HeapTupleHeader htup, RelFileLocator *rl
 					}
 					else
 					{
+						/* SQL mode: bounded SQL literal rendering (debug/compat). */
 						const char *reason = NULL;
 						size_t		start = valpos;
 						bool		ok;
@@ -1082,13 +1143,6 @@ mine_decode_dml(WalExtractContext *ctx, HeapTupleHeader htup, RelFileLocator *rl
 							valpos = sizeof(valstore) - 1;
 						valstore[valpos++] = '\0';	/* terminate + separate */
 						cc->value_text = valstore + start;
-						cc->raw_ptr = vptr;
-						if (c->attlen == -1)
-							cc->raw_len = VARSIZE_ANY(vptr);
-						else if (c->attlen == -2)
-							cc->raw_len = strlen(vptr) + 1;
-						else
-							cc->raw_len = (Size) c->attlen;
 						if (!ok)
 						{
 							cc->complete = false;
@@ -1132,13 +1186,18 @@ mine_decode_dml(WalExtractContext *ctx, HeapTupleHeader htup, RelFileLocator *rl
 		if (ev.relname)
 			ev_add_reason(&ev, WER_SCHEMA_MISSING);
 
-		if (mine_format_insert(&ev, op_text, sizeof(op_text)) && ev.complete)
+		if (ctx->render_mode == WX_RENDER_SQL)
 		{
-			ev.complete = false;
-			ev_add_reason(&ev, WER_VALUE_TRUNCATED);
-			mine_format_insert(&ev, op_text, sizeof(op_text));
+			if (mine_format_insert(&ev, op_text, sizeof(op_text)) && ev.complete)
+			{
+				ev.complete = false;
+				ev_add_reason(&ev, WER_VALUE_TRUNCATED);
+				mine_format_insert(&ev, op_text, sizeof(op_text));
+			}
+			ev.op_text = op_text;
 		}
-		ev.op_text = op_text;
+		else
+			ev.op_text = NULL;		/* event mode: SQL is a downstream formatter */
 		we_emit_event(ctx, &ev);
 	}
 }
@@ -1623,6 +1682,7 @@ walextract_context_reset(WalExtractContext *ctx)
 	void	   *sink = ctx->emit_sink;
 	bool		boot = ctx->do_bootstrap;
 	Oid			tdb = ctx->target_db;
+	WalExtractRenderMode mode = ctx->render_mode;
 	char		pg[1024];
 
 	we_buf_free_all(ctx);		/* drop any open-transaction buffer first */
@@ -1632,6 +1692,7 @@ walextract_context_reset(WalExtractContext *ctx)
 	ctx->emit_sink = sink;
 	ctx->do_bootstrap = boot;
 	ctx->target_db = tdb;
+	ctx->render_mode = mode;
 	strlcpy(ctx->pgdata, pg, sizeof(ctx->pgdata));
 }
 
@@ -1661,6 +1722,12 @@ void
 walextract_set_bootstrap(WalExtractContext *ctx, bool on)
 {
 	ctx->do_bootstrap = on;
+}
+
+void
+walextract_set_render_mode(WalExtractContext *ctx, WalExtractRenderMode mode)
+{
+	ctx->render_mode = mode;
 }
 
 void

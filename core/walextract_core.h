@@ -90,6 +90,12 @@ typedef enum WalExtractStatus
 	WALEXTRACT_FATAL_ABORTED_DDL		/* aborted txn already mutated the (non-txnal) dictionary */
 } WalExtractStatus;
 
+typedef enum WalExtractRenderMode
+{
+	WX_RENDER_SQL = 0,			/* default: render SQL literal/op_text (debug/compat) */
+	WX_RENDER_EVENT				/* product hot path: raw typed payload, no SQL rendering */
+} WalExtractRenderMode;
+
 typedef struct WalExtractContext WalExtractContext;
 typedef void (*WalExtractEmit) (const ChangeEvent *ev, void *sink);
 
@@ -102,6 +108,7 @@ extern void walextract_set_pgdata(WalExtractContext *ctx, const char *pgdata);
 extern void walextract_set_filenodes(WalExtractContext *ctx, Oid pgclass_fn, Oid pgattr_fn);
 extern void walextract_set_bootstrap(WalExtractContext *ctx, bool on);
 extern void walextract_set_target_db(WalExtractContext *ctx, Oid dboid);
+extern void walextract_set_render_mode(WalExtractContext *ctx, WalExtractRenderMode mode);
 
 extern void walextract_record(WalExtractContext *ctx, XLogReaderState *record);
 

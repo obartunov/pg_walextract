@@ -52,7 +52,7 @@ walextract_print_event(const ChangeEvent *ev, void *sink)
 		   ev->complete ? "complete" : "incomplete",
 		   ev->nreasons ? ":" : "", rb,
 		   ev->relname ? " " : "", ev->relname ? ev->relname : "",
-		   ev->op_text);
+		   ev->op_text ? ev->op_text : "");
 }
 #include "storage/bufpage.h"
 #include "access/rmgr.h"
@@ -1488,6 +1488,8 @@ main(int argc, char **argv)
 	if (wectx == NULL)
 		pg_fatal("out of memory");
 	walextract_set_emit(wectx, walextract_print_event, NULL);
+	if (getenv("MINE_EVENT_MODE"))
+		walextract_set_render_mode(wectx, WX_RENDER_EVENT);
 	if (getenv("MINE_DBOID"))
 		walextract_set_target_db(wectx, (Oid) strtoul(getenv("MINE_DBOID"), NULL, 10));
 	if (getenv("MINE_PGCLASS") || getenv("MINE_PGATTR"))
