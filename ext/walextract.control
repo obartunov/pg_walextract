@@ -1,0 +1,4 @@
+comment = 'mine DDL/DML effects directly from WAL (research prototype)'
+default_version = '1.0'
+module_pathname = '$libdir/walextract'
+relocatable = true

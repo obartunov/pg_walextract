@@ -1,0 +1,11 @@
+*.o
+*.so
+*.dylib
+*.a
+*.d
+*.log
+*.diffs
+*.tmp
+results/
+tmp_check/
+.DS_Store

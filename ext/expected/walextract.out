@@ -1,0 +1,177 @@
+-- walextract smoke contract.
+-- Non-deterministic values (lsn/xid/oid) appear ONLY in boolean checks or are
+-- filtered out; exact-match assertions use op_text/reasons on user relations.
+CREATE EXTENSION walextract;
+-- pre-existing relation (created BEFORE any mined range): its descriptor is
+-- never seen inside a range, so it must decode as dictionary_missing.
+CREATE TABLE wx_pre (id int, v int);
+-- case 1: supported types -> complete=true, replayable op_text
+SELECT pg_current_wal_lsn() AS s1 \gset
+CREATE TABLE wx_t (id int, name text, ok bool, amt float8);
+INSERT INTO wx_t VALUES (1, 'O''Brien', true, 3.14), (2, NULL, false, 9);
+SELECT pg_current_wal_lsn() AS e1 \gset
+SELECT op, relation, complete, op_text
+  FROM walextract_wal2sql(:'s1', :'e1')
+ WHERE op = 'INSERT' AND relation = 'wx_t' ORDER BY op_text;
+   op   | relation | complete |                                      op_text                                       
+--------+----------+----------+------------------------------------------------------------------------------------
+ INSERT | wx_t     | t        | INSERT INTO "wx_t" ("id", "name", "ok", "amt") VALUES (1, 'O''Brien', true, 3.14);
+ INSERT | wx_t     | t        | INSERT INTO "wx_t" ("id", "name", "ok", "amt") VALUES (2, NULL, false, 9);
+(2 rows)
+
+-- case 2: unsupported type (numeric) -> complete=false, reason unknown_type
+SELECT pg_current_wal_lsn() AS s2 \gset
+CREATE TABLE wx_u (id int, n numeric);
+INSERT INTO wx_u VALUES (1, 123.45);
+SELECT pg_current_wal_lsn() AS e2 \gset
+SELECT op, relation, complete, reasons, op_text
+  FROM walextract_wal2sql(:'s2', :'e2')
+ WHERE op = 'INSERT' AND relation = 'wx_u';
+   op   | relation | complete |            reasons            |                                op_text                                
+--------+----------+----------+-------------------------------+-----------------------------------------------------------------------
+ INSERT | wx_u     | f        | {unknown_type,schema_missing} | -- INCOMPLETE INSERT rel="wx_u" reasons={unknown_type,schema_missing}
+(1 row)
+
+-- case 3: external TOAST pointer -> complete=false, reason toast_external
+SELECT pg_current_wal_lsn() AS s3 \gset
+CREATE TABLE wx_b (id int, big text);
+ALTER TABLE wx_b ALTER COLUMN big SET STORAGE EXTERNAL;
+INSERT INTO wx_b VALUES (1, repeat('A', 3000));
+SELECT pg_current_wal_lsn() AS e3 \gset
+SELECT op, relation, complete, reasons, op_text
+  FROM walextract_wal2sql(:'s3', :'e3')
+ WHERE op = 'INSERT' AND relation = 'wx_b';
+   op   | relation | complete |             reasons             |                                 op_text                                 
+--------+----------+----------+---------------------------------+-------------------------------------------------------------------------
+ INSERT | wx_b     | f        | {toast_external,schema_missing} | -- INCOMPLETE INSERT rel="wx_b" reasons={toast_external,schema_missing}
+(1 row)
+
+-- case 4: unknown relation/descriptor -> complete=false, reason dictionary_missing
+SELECT pg_current_wal_lsn() AS s4 \gset
+INSERT INTO wx_pre VALUES (7, 8);
+SELECT pg_current_wal_lsn() AS e4 \gset
+SELECT op, complete, 'dictionary_missing' = ANY(reasons) AS dict_missing
+  FROM walextract_wal2sql(:'s4', :'e4')
+ WHERE op = 'INSERT' AND complete IS FALSE AND 'dictionary_missing' = ANY(reasons);
+   op   | complete | dict_missing 
+--------+----------+--------------
+ INSERT | f        | t
+(1 row)
+
+-- case 5: more columns than capacity -> complete=false, reason too_many_columns
+SELECT pg_current_wal_lsn() AS s5 \gset
+SELECT 'CREATE TABLE wx_many (' || string_agg('c' || i || ' int', ', ') || ')'
+  FROM generate_series(1, 90) i \gexec
+CREATE TABLE wx_many (c1 int, c2 int, c3 int, c4 int, c5 int, c6 int, c7 int, c8 int, c9 int, c10 int, c11 int, c12 int, c13 int, c14 int, c15 int, c16 int, c17 int, c18 int, c19 int, c20 int, c21 int, c22 int, c23 int, c24 int, c25 int, c26 int, c27 int, c28 int, c29 int, c30 int, c31 int, c32 int, c33 int, c34 int, c35 int, c36 int, c37 int, c38 int, c39 int, c40 int, c41 int, c42 int, c43 int, c44 int, c45 int, c46 int, c47 int, c48 int, c49 int, c50 int, c51 int, c52 int, c53 int, c54 int, c55 int, c56 int, c57 int, c58 int, c59 int, c60 int, c61 int, c62 int, c63 int, c64 int, c65 int, c66 int, c67 int, c68 int, c69 int, c70 int, c71 int, c72 int, c73 int, c74 int, c75 int, c76 int, c77 int, c78 int, c79 int, c80 int, c81 int, c82 int, c83 int, c84 int, c85 int, c86 int, c87 int, c88 int, c89 int, c90 int)
+INSERT INTO wx_many DEFAULT VALUES;
+SELECT pg_current_wal_lsn() AS e5 \gset
+SELECT op, complete, 'too_many_columns' = ANY(reasons) AS too_many
+  FROM walextract_wal2sql(:'s5', :'e5')
+ WHERE op = 'INSERT' AND complete IS FALSE AND 'too_many_columns' = ANY(reasons);
+   op   | complete | too_many 
+--------+----------+----------
+ INSERT | f        | t
+(1 row)
+
+-- case 6: inline value larger than the render buffer -> complete=false, value_truncated
+SELECT pg_current_wal_lsn() AS s6 \gset
+CREATE TABLE wx_long (id int, t text);
+ALTER TABLE wx_long ALTER COLUMN t SET STORAGE PLAIN;
+INSERT INTO wx_long VALUES (1, repeat('B', 4000));
+SELECT pg_current_wal_lsn() AS e6 \gset
+SELECT op, relation, complete, 'value_truncated' = ANY(reasons) AS truncated
+  FROM walextract_wal2sql(:'s6', :'e6')
+ WHERE op = 'INSERT' AND relation = 'wx_long';
+   op   | relation | complete | truncated 
+--------+----------+----------+-----------
+ INSERT | wx_long  | f        | t
+(1 row)
+
+-- case 7: value overflow MID-row must not leave value_text past the buffer
+SELECT pg_current_wal_lsn() AS s7 \gset
+CREATE TABLE wx_long_mid (id int, t text, tail int);
+ALTER TABLE wx_long_mid ALTER COLUMN t SET STORAGE PLAIN;
+INSERT INTO wx_long_mid VALUES (1, repeat('B', 4000), 2);
+SELECT pg_current_wal_lsn() AS e7 \gset
+SELECT op, relation, complete, 'value_truncated' = ANY(reasons) AS truncated
+  FROM walextract_wal2sql(:'s7', :'e7')
+ WHERE op = 'INSERT' AND relation = 'wx_long_mid';
+   op   |  relation   | complete | truncated 
+--------+-------------+----------+-----------
+ INSERT | wx_long_mid | f        | t
+(1 row)
+
+-- case 8: newline in value must not break out of the comment on incomplete op_text
+SELECT pg_current_wal_lsn() AS s8 \gset
+CREATE TABLE wx_nl (t text, n numeric);
+INSERT INTO wx_nl VALUES (E'a\nb', 1.2);
+SELECT pg_current_wal_lsn() AS e8 \gset
+SELECT op, relation, complete,
+       strpos(op_text, E'\n') = 0 AS single_line,
+       op_text LIKE '--%'         AS commented
+  FROM walextract_wal2sql(:'s8', :'e8')
+ WHERE op = 'INSERT' AND relation = 'wx_nl';
+   op   | relation | complete | single_line | commented 
+--------+----------+----------+-------------+-----------
+ INSERT | wx_nl    | f        | t           | t
+(1 row)
+
+-- case 9: catalog identity containing a newline must stay one commented line
+SELECT pg_current_wal_lsn() AS s9 \gset
+CREATE TABLE wx_cat (a int);
+ALTER TABLE wx_cat RENAME COLUMN a TO "c
+d";
+SELECT pg_current_wal_lsn() AS e9 \gset
+SELECT bool_and(op_text LIKE '--%' AND strpos(op_text, E'\n') = 0)
+         AS catalog_oneline_commented
+  FROM walextract_wal2sql(:'s9', :'e9')
+ WHERE op = 'DDL_CATALOG';
+ catalog_oneline_commented 
+---------------------------
+ t
+(1 row)
+
+-- #7 global invariant: no complete=false event exposes bare replayable SQL
+SELECT bool_and(op_text LIKE '--%' AND strpos(op_text, E'\n') = 0)
+         AS incomplete_oneline_commented
+  FROM walextract_wal2sql(:'s1', :'e8')
+ WHERE complete IS FALSE;
+ incomplete_oneline_commented 
+------------------------------
+ t
+(1 row)
+
+-- provenance sanity on case 1 (booleans only)
+SELECT bool_and(w.xid = t.x)                                  AS xid_matches_xmin,
+       bool_and(w.record_lsn >= :'s1' AND w.record_lsn <= :'e1') AS lsn_in_range
+  FROM walextract_wal2sql(:'s1', :'e1') w,
+       (SELECT DISTINCT xmin AS x FROM wx_t) t
+ WHERE w.op = 'INSERT' AND w.relation = 'wx_t';
+ xid_matches_xmin | lsn_in_range 
+------------------+--------------
+ t                | t
+(1 row)
+
+-- round-trip: replaying complete op_text reproduces the original rows
+CREATE TEMP TABLE wx_lsn(s pg_lsn, e pg_lsn);
+INSERT INTO wx_lsn VALUES (:'s1', :'e1');
+TRUNCATE wx_t;
+DO $$
+DECLARE r record; lo pg_lsn; hi pg_lsn;
+BEGIN
+  SELECT s, e INTO lo, hi FROM wx_lsn;
+  FOR r IN SELECT op_text FROM walextract_wal2sql(lo, hi)
+           WHERE op = 'INSERT' AND relation = 'wx_t' AND complete ORDER BY op_text
+  LOOP
+    EXECUTE r.op_text;
+  END LOOP;
+END $$;
+SELECT id, name, ok, amt FROM wx_t ORDER BY id;
+ id |  name   | ok | amt  
+----+---------+----+------
+  1 | O'Brien | t  | 3.14
+  2 |         | f  |    9
+(2 rows)
+
+DROP TABLE wx_t, wx_u, wx_b, wx_pre, wx_many, wx_long, wx_long_mid, wx_nl, wx_cat;
+DROP EXTENSION walextract;

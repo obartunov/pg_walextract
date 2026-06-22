@@ -1,0 +1,8 @@
+# Add to src/bin/pg_waldump/Makefile (after the existing OBJS definition).
+# Builds the pg_walextract binary as a derivative of pg_waldump, reusing all
+# rmgrdesc/xlogreader objects but swapping pg_waldump.o for the walextract
+# frontend + core.
+
+PG_WALEXTRACT_OBJS = $(filter-out pg_waldump.o,$(OBJS)) walextract_core.o pg_walextract.o
+pg_walextract: $(PG_WALEXTRACT_OBJS) | submake-libpgport submake-libpgfeutils
+	$(CC) $(CFLAGS) $(PG_WALEXTRACT_OBJS) $(LDFLAGS) $(LDFLAGS_INTERNAL) $(LIBS) -o $@$(X)
