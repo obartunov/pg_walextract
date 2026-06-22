@@ -1,0 +1,27 @@
+HotPath v0 measurement (repo, tag walextract-txassembler-v0 + hotpath-v0).
+SQL mode = default; EVENT mode = MINE_EVENT_MODE=1; same WAL range per workload;
+min of 3 wall-clock runs. Lab-controlled safe start (CHECKPOINT quiet point);
+NOT arbitrary-LSN apply safety. Reproduce: bench/hotpath_bench.sh (env-driven).
+
+--- debug build (-O0 --enable-debug) ---
+workload      SQL_ms  EVENT_ms  speedup
+W3_wide        86.0     28.7      3.0x
+W6_longtext   296.6     25.5     11.6x
+Wsmall(20k)   101.4     70.7      1.4x
+Wunknown       38.1     26.2      1.5x
+
+--- release build (-O2 -DNDEBUG; walextract objects optimized; upstream
+    describe/xlogreader remain installed -O0; ratio is the confirmation,
+    absolute is mixed) ---
+workload      SQL_ms  EVENT_ms  speedup
+W3_wide        64.9     19.2      3.4x
+W6_longtext   253.4     19.2     13.2x
+Wsmall(20k)    82.5     54.9      1.5x
+Wunknown       30.7     22.7      1.4x
+
+Validation (both builds):
+- EVENT raw_bytes > 0 (raw payload preserved across TxAssembler buffering);
+  SQL raw_bytes = 0 (SQL keeps rendered text only).
+- W6 partial 3014 -> 14 (event copies full raw value; no value_truncated).
+- Wunknown partial 8013 -> 13 (unknown_type is a SQL-renderer reason, not event loss).
+- EVENT optext_bytes tiny (DDL_CATALOG only; INSERT op_text NULL).

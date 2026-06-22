@@ -35,6 +35,13 @@
 
 static WalExtractContext *wectx = NULL;
 
+#ifdef WALEXTRACT_BENCH
+static unsigned long long g_bench_events = 0;
+static unsigned long long g_bench_partial = 0;
+static unsigned long long g_bench_optext_bytes = 0;
+static unsigned long long g_bench_raw_bytes = 0;   /* sum of cols raw_len at sink */
+#endif
+
 static void
 walextract_print_event(const ChangeEvent *ev, void *sink)
 {
@@ -43,6 +50,17 @@ walextract_print_event(const ChangeEvent *ev, void *sink)
 	int			i;
 
 	(void) sink;
+#ifdef WALEXTRACT_BENCH
+	{
+		int k;
+		g_bench_events++;
+		g_bench_partial += ev->complete ? 0 : 1;
+		if (ev->op_text)
+			g_bench_optext_bytes += strlen(ev->op_text);
+		for (k = 0; k < ev->ncols; k++)
+			g_bench_raw_bytes += ev->cols[k].raw_len;
+	}
+#endif
 	rb[0] = '\0';
 	for (i = 0; i < ev->nreasons; i++)
 		o += snprintf(rb + o, sizeof(rb) - o, "%s%s", i ? "," : "", ev->reasons[i]);
@@ -1603,6 +1621,12 @@ main(int argc, char **argv)
 	if (wectx != NULL && walextract_failed(wectx))
 		pg_fatal("walextract could not assemble transactions: %s",
 				 walextract_status_message(wectx));
+
+#ifdef WALEXTRACT_BENCH
+	fprintf(stderr, "BENCH records=%lld events=%llu partial=%llu optext_bytes=%llu raw_bytes=%llu\n",
+			(long long) config.already_displayed_records,
+			g_bench_events, g_bench_partial, g_bench_optext_bytes, g_bench_raw_bytes);
+#endif
 
 	/*
 	 * Disarm atexit cleanup of open WAL file; XLogReaderFree will close it,
