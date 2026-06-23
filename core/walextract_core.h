@@ -75,6 +75,42 @@ typedef struct ChangeEvent
 } ChangeEvent;
 
 /*
+ * P2A ChangeBatch (machine consumer path).  One HEAP2 MULTI_INSERT WAL record
+ * becomes ONE columnar batch: schema is referenced once (snapshotted typing per
+ * column), payload is column-major and arena-owned.  No SQL text, no op_text,
+ * no per-row attname, no per-row event.  ChangeEvent is unchanged and remains
+ * the forensic/SRF path; ChangeBatch is additive.
+ */
+typedef struct ChangeVector
+{
+	int16		attlen;			/* snapshot: >0 fixed, -1 varlena, -2 cstring */
+	bool		byval;
+	char		attalign;
+	Oid			typid;
+	/* fixed-len (attlen>0): values is a flat nrows*attlen array (SIMD-addressable) */
+	uint8	   *values;
+	/* varlena/cstring: varoff[nrows+1] offsets into varblob; values is NULL */
+	uint32	   *varoff;
+	uint8	   *varblob;
+	/* nrows-bit null bitmap, bit set = SQL NULL (value slot then undefined) */
+	uint64	   *nullbits;
+} ChangeVector;
+
+typedef struct ChangeBatch
+{
+	XLogRecPtr	record_lsn;		/* one WAL record per batch in v0 */
+	XLogRecPtr	commit_lsn;		/* set by TxAssembler at COMMIT */
+	TransactionId xid;
+	Oid			db_oid;
+	Oid			rel_oid;
+	Oid			relfilenode;
+	int			ncols;			/* 0 when schema_missing */
+	int			nrows;
+	bool		schema_missing;	/* no descriptor: rows counted, no typed columns */
+	ChangeVector *cols;			/* ncols vectors, arena-owned (NULL if schema_missing) */
+} ChangeBatch;
+
+/*
  * Transaction-assembler status.  The miner buffers physical ChangeEvents by
  * xid and only emits a transaction's events on its COMMIT record; it must
  * never expose an aborted or still-open transaction as committed.  When the
@@ -99,12 +135,16 @@ typedef enum WalExtractRenderMode
 
 typedef struct WalExtractContext WalExtractContext;
 typedef void (*WalExtractEmit) (const ChangeEvent *ev, void *sink);
+typedef void (*WalExtractEmitBatch) (const ChangeBatch *b, void *sink);
 
 extern WalExtractContext *walextract_context_create(void);
 extern void walextract_context_free(WalExtractContext *ctx);
 extern void walextract_context_reset(WalExtractContext *ctx);
 
 extern void walextract_set_emit(WalExtractContext *ctx, WalExtractEmit cb, void *sink);
+extern void walextract_set_emit_batch(WalExtractContext *ctx, WalExtractEmitBatch cb, void *sink);
+extern Size walextract_buf_peak(const WalExtractContext *ctx);
+extern Size walextract_bbuf_peak(const WalExtractContext *ctx);
 extern void walextract_set_pgdata(WalExtractContext *ctx, const char *pgdata);
 extern void walextract_set_filenodes(WalExtractContext *ctx, Oid pgclass_fn, Oid pgattr_fn);
 extern void walextract_set_bootstrap(WalExtractContext *ctx, bool on);

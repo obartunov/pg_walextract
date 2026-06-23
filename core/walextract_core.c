@@ -160,6 +160,16 @@ struct WalExtractContext
 	Size		buf_bytes;		/* total bytes held by the buffer (cap accounting) */
 	WalExtractStatus status;	/* fail-closed status (WALEXTRACT_OK = healthy) */
 	WalExtractRenderMode render_mode;	/* WX_RENDER_SQL (default) / WX_RENDER_EVENT */
+
+	/* P2A machine-path batch sink + WAL-order batch buffer (parallel to event buffer) */
+	WalExtractEmitBatch batch_emit_cb;
+	void	   *batch_emit_sink;
+	struct WeBufBatch *bbuf_head;
+	struct WeBufBatch *bbuf_tail;
+	int			bbuf_nlive;
+	Size		bbuf_bytes;
+	Size		buf_bytes_peak;		/* peak event-buffer bytes (commit-buffer memory) */
+	Size		bbuf_bytes_peak;	/* peak batch-buffer bytes */
 };
 
 /* ===================== small helpers ===================== */
@@ -364,6 +374,8 @@ we_emit_event(WalExtractContext *ctx, ChangeEvent *ev)
 	}
 	ctx->buf_nlive++;
 	ctx->buf_bytes += total;
+	if (ctx->buf_bytes > ctx->buf_bytes_peak)
+		ctx->buf_bytes_peak = ctx->buf_bytes;
 }
 
 /* is xid the transaction or one of its committed/aborted subxacts? */
@@ -1556,6 +1568,317 @@ we_apply_drop_boundaries(WalExtractContext *ctx, xl_xact_parsed_commit *parsed,
 	}
 }
 
+/* ===================== P2A ChangeBatch (machine path) ===================== */
+
+typedef struct WeBufBatch
+{
+	struct WeBufBatch *next;
+	size_t		bytes;			/* size of this single allocation (node + arena) */
+	ChangeBatch b;				/* cols[] + column arrays live in the trailing arena */
+} WeBufBatch;
+
+static int
+we_desc_nlogical(const MineRelDesc *d)
+{
+	int			n = 0,
+				i;
+
+	for (i = 0; i < d->ncols; i++)
+		if (!d->cols[i].attisdropped)
+			n++;
+	return n;
+}
+
+/*
+ * Allocate one columnar batch for a MULTI_INSERT record in a single arena:
+ * ChangeVector array, then per logical column a null bitmap plus either a flat
+ * fixed-width value array or a varlena offset array + blob.  Typing is snapshot
+ * from the descriptor (no per-row attname, no descriptor deref on the consumer).
+ * d == NULL => schema_missing batch (rows counted only, no typed columns).
+ */
+static WeBufBatch *
+we_batch_begin(WalExtractContext *ctx, Oid relid, Oid relfile,
+			   MineRelDesc *d, int nrows, Size total_payload)
+{
+	int			nlog = d ? we_desc_nlogical(d) : 0;
+	size_t		nbb = ((size_t) ((nrows + 63) / 64)) * 8;
+	size_t		arena = MAXALIGN((size_t) nlog * sizeof(ChangeVector));
+	size_t		total;
+	WeBufBatch *bb;
+	char	   *cur;
+	int			i,
+				lj;
+
+	if (d)
+	{
+		for (i = 0; i < d->ncols; i++)
+		{
+			MineCol    *c = &d->cols[i];
+
+			if (c->attisdropped)
+				continue;
+			arena += MAXALIGN(nbb);
+			if (c->attlen > 0)
+				arena += MAXALIGN((size_t) nrows * c->attlen);
+			else
+			{
+				arena += MAXALIGN((size_t) (nrows + 1) * sizeof(uint32));
+				arena += MAXALIGN(total_payload);	/* per-column varblob upper bound */
+			}
+		}
+	}
+	total = sizeof(WeBufBatch) + arena;
+
+	if (ctx->bbuf_bytes + total > (Size) WALEXTRACT_MAX_BUFFERED_BYTES)
+	{
+		ctx->status = WALEXTRACT_FATAL_BUFFER_OVERFLOW;
+		return NULL;
+	}
+	bb = (WeBufBatch *) malloc(total);
+	if (bb == NULL)
+	{
+		ctx->status = WALEXTRACT_FATAL_OOM;
+		return NULL;
+	}
+	memset(bb, 0, sizeof(WeBufBatch));
+	bb->bytes = total;
+	bb->b.record_lsn = ctx->cur_lsn;
+	bb->b.commit_lsn = InvalidXLogRecPtr;
+	bb->b.xid = ctx->cur_xid;
+	bb->b.db_oid = ctx->bound_db;
+	bb->b.rel_oid = relid;
+	bb->b.relfilenode = relfile;
+	bb->b.nrows = nrows;
+	bb->b.ncols = nlog;
+	bb->b.schema_missing = (d == NULL);
+
+	if (d == NULL)
+		return bb;
+
+	cur = (char *) (bb + 1);
+	bb->b.cols = (ChangeVector *) cur;
+	cur += MAXALIGN((size_t) nlog * sizeof(ChangeVector));
+	memset(bb->b.cols, 0, (size_t) nlog * sizeof(ChangeVector));
+
+	lj = 0;
+	for (i = 0; i < d->ncols; i++)
+	{
+		MineCol    *c = &d->cols[i];
+		ChangeVector *v;
+
+		if (c->attisdropped)
+			continue;
+		v = &bb->b.cols[lj++];
+		v->attlen = c->attlen;
+		v->byval = c->attbyval;
+		v->attalign = c->attalign;
+		v->typid = c->atttypid;
+		v->nullbits = (uint64 *) cur;
+		memset(cur, 0, nbb);
+		cur += MAXALIGN(nbb);
+		if (c->attlen > 0)
+		{
+			v->values = (uint8 *) cur;
+			cur += MAXALIGN((size_t) nrows * c->attlen);
+		}
+		else
+		{
+			v->varoff = (uint32 *) cur;
+			cur += MAXALIGN((size_t) (nrows + 1) * sizeof(uint32));
+			v->varblob = (uint8 *) cur;
+			cur += MAXALIGN(total_payload);
+			v->varoff[0] = 0;
+		}
+	}
+	return bb;
+}
+
+/* deform one tuple into batch row `row` (column-major scatter); single pass */
+static void
+we_batch_row(WeBufBatch *bb, MineRelDesc *d, int row, HeapTupleHeader htup)
+{
+	int			natts = HeapTupleHeaderGetNatts(htup);
+	bool		hasnulls = (htup->t_infomask & HEAP_HASNULL) != 0;
+	uint8	   *bp = htup->t_bits;
+	char	   *tp = (char *) htup + htup->t_hoff;
+	long		off = 0;
+	int			i,
+				lj = 0;
+
+	for (i = 0; i < d->ncols && i < natts; i++)
+	{
+		MineCol    *c = &d->cols[i];
+		bool		isnull = (hasnulls && att_isnull(i, bp));
+		ChangeVector *v;
+		char	   *vptr;
+		Size		rawlen;
+
+		if (c->attisdropped)
+		{
+			if (!isnull)
+			{
+				if (c->attlen == -1)
+					off = att_align_pointer(off, c->attalign, -1, tp + off);
+				else if (c->attlen != -2)
+					off = att_align_nominal(off, c->attalign);
+				if (c->attlen == -1)
+					off += VARSIZE_ANY(tp + off);
+				else if (c->attlen == -2)
+					off += strlen(tp + off) + 1;
+				else
+					off += c->attlen;
+			}
+			continue;
+		}
+
+		v = &bb->b.cols[lj++];
+		if (isnull)
+		{
+			v->nullbits[row >> 6] |= (uint64) 1 << (row & 63);
+			if (c->attlen <= 0)
+				v->varoff[row + 1] = v->varoff[row];
+			continue;
+		}
+
+		if (c->attlen == -1)
+			off = att_align_pointer(off, c->attalign, -1, tp + off);
+		else if (c->attlen != -2)
+			off = att_align_nominal(off, c->attalign);
+		vptr = tp + off;
+
+		if (c->attlen > 0)
+		{
+			rawlen = (Size) c->attlen;
+			memcpy(v->values + (size_t) row * c->attlen, vptr, rawlen);
+		}
+		else
+		{
+			rawlen = (c->attlen == -1) ? VARSIZE_ANY(vptr) : (Size) strlen(vptr) + 1;
+			memcpy(v->varblob + v->varoff[row], vptr, rawlen);
+			v->varoff[row + 1] = v->varoff[row] + (uint32) rawlen;
+		}
+		off += rawlen;
+	}
+	/* logical columns the tuple does not reach (added-after-insert): NULL */
+	for (; i < d->ncols; i++)
+	{
+		ChangeVector *v;
+
+		if (d->cols[i].attisdropped)
+			continue;
+		v = &bb->b.cols[lj++];
+		v->nullbits[row >> 6] |= (uint64) 1 << (row & 63);
+		if (v->attlen <= 0)
+			v->varoff[row + 1] = v->varoff[row];
+	}
+}
+
+static void
+we_batch_commit(WalExtractContext *ctx, WeBufBatch *bb)
+{
+	if (bb == NULL)
+		return;
+	if (ctx->bbuf_tail == NULL)
+		ctx->bbuf_head = ctx->bbuf_tail = bb;
+	else
+	{
+		ctx->bbuf_tail->next = bb;
+		ctx->bbuf_tail = bb;
+	}
+	ctx->bbuf_nlive++;
+	ctx->bbuf_bytes += bb->bytes;
+	if (ctx->bbuf_bytes > ctx->bbuf_bytes_peak)
+		ctx->bbuf_bytes_peak = ctx->bbuf_bytes;
+}
+
+static void
+we_bbatch_node_free(WalExtractContext *ctx, WeBufBatch *bb)
+{
+	ctx->bbuf_bytes -= bb->bytes;
+	ctx->bbuf_nlive--;
+	free(bb);
+}
+
+/* COMMIT: deliver family batches (unless relfilenode dropped same-tx), then drop */
+static void
+we_flush_batches(WalExtractContext *ctx, TransactionId topxid,
+				 const TransactionId *subxacts, int nsub, XLogRecPtr commit_lsn,
+				 const xl_xact_parsed_commit *parsed)
+{
+	WeBufBatch *node = ctx->bbuf_head;
+	WeBufBatch *prev = NULL;
+
+	while (node != NULL)
+	{
+		WeBufBatch *next = node->next;
+
+		if (we_xid_in_family(node->b.xid, topxid, subxacts, nsub))
+		{
+			if (!we_commit_drops_relfile(ctx, parsed, node->b.relfilenode))
+			{
+				node->b.commit_lsn = commit_lsn;
+				if (ctx->batch_emit_cb)
+					ctx->batch_emit_cb(&node->b, ctx->batch_emit_sink);
+			}
+			if (prev == NULL)
+				ctx->bbuf_head = next;
+			else
+				prev->next = next;
+			if (ctx->bbuf_tail == node)
+				ctx->bbuf_tail = prev;
+			we_bbatch_node_free(ctx, node);
+		}
+		else
+			prev = node;
+		node = next;
+	}
+}
+
+/* ABORT: drop family batches without delivery */
+static void
+we_discard_batches(WalExtractContext *ctx, TransactionId topxid,
+				   const TransactionId *subxacts, int nsub)
+{
+	WeBufBatch *node = ctx->bbuf_head;
+	WeBufBatch *prev = NULL;
+
+	while (node != NULL)
+	{
+		WeBufBatch *next = node->next;
+
+		if (we_xid_in_family(node->b.xid, topxid, subxacts, nsub))
+		{
+			if (prev == NULL)
+				ctx->bbuf_head = next;
+			else
+				prev->next = next;
+			if (ctx->bbuf_tail == node)
+				ctx->bbuf_tail = prev;
+			we_bbatch_node_free(ctx, node);
+		}
+		else
+			prev = node;
+		node = next;
+	}
+}
+
+static void
+we_bbuf_free_all(WalExtractContext *ctx)
+{
+	WeBufBatch *node = ctx->bbuf_head;
+
+	while (node != NULL)
+	{
+		WeBufBatch *next = node->next;
+
+		free(node);
+		node = next;
+	}
+	ctx->bbuf_head = ctx->bbuf_tail = NULL;
+	ctx->bbuf_nlive = 0;
+	ctx->bbuf_bytes = 0;
+}
+
 /* ===================== record dispatch ===================== */
 
 void
@@ -1599,6 +1922,8 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 			 */
 			we_flush_family(ctx, topxid, parsed.subxacts, parsed.nsubxacts,
 							record->ReadRecPtr, &parsed);
+			we_flush_batches(ctx, topxid, parsed.subxacts, parsed.nsubxacts,
+							 record->ReadRecPtr, &parsed);
 			we_apply_drop_boundaries(ctx, &parsed, record->ReadRecPtr, topxid);
 		}
 		else if (xact_op == XLOG_XACT_ABORT)
@@ -1608,6 +1933,7 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 
 			ParseAbortRecord(xact_info, xlrec, &parsed);
 			we_discard_family(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
+			we_discard_batches(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
 		}
 		else if (xact_op == XLOG_XACT_PREPARE ||
 				 xact_op == XLOG_XACT_COMMIT_PREPARED ||
@@ -1685,6 +2011,82 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		xl_heap_multi_insert *xlrec = (xl_heap_multi_insert *) XLogRecGetData(record);
 		char	   *ptr = XLogRecGetBlockData(record, 0, &datalen);
 		int			i;
+
+		/*
+		 * Machine batch path (P2A): a MULTI_INSERT of a user relation becomes ONE
+		 * ChangeBatch.  Catalog multi-inserts still go per-tuple below so the
+		 * dictionary keeps learning.  Single-active mode: when a batch sink is
+		 * registered the event sink is absent, so no tee.
+		 */
+		if (ctx->batch_emit_cb && !mine_is_catalog(ctx, rloc.relNumber))
+		{
+			Oid			relfile = rloc.relNumber;
+			Oid			relid = mine_relfile_get(ctx, relfile);
+
+			if (!(relfile < FirstNormalObjectId && relid == InvalidOid))
+			{
+				MineRelDesc *d;
+				WeBufBatch *bb;
+				int			row = 0;
+
+				if (relid == InvalidOid)
+					relid = relfile;
+				d = mine_desc_get(ctx, relid, false);
+
+				if (ptr == NULL)
+				{
+					char		pagebuf[BLCKSZ];
+
+					bb = we_batch_begin(ctx, relid, relfile, d, xlrec->ntuples, BLCKSZ);
+					if (bb != NULL && XLogRecHasBlockImage(record, 0) &&
+						RestoreBlockImage(record, 0, pagebuf))
+					{
+						for (i = 0; i < xlrec->ntuples; i++)
+						{
+							ItemId		lp = PageGetItemId((Page) pagebuf, xlrec->offsets[i]);
+
+							if (!ItemIdIsNormal(lp))
+								continue;
+							if (d != NULL)
+								we_batch_row(bb, d, row, (HeapTupleHeader) PageGetItem((Page) pagebuf, lp));
+							row++;
+						}
+					}
+				}
+				else
+				{
+					bb = we_batch_begin(ctx, relid, relfile, d, xlrec->ntuples, datalen);
+					for (i = 0; bb != NULL && i < xlrec->ntuples; i++)
+					{
+						xl_multi_insert_tuple *xlhdr;
+						char		tupbuf[2 * BLCKSZ];
+						HeapTupleHeader htup = (HeapTupleHeader) tupbuf;
+
+						ptr = (char *) SHORTALIGN(ptr);
+						xlhdr = (xl_multi_insert_tuple *) ptr;
+						ptr += SizeOfMultiInsertTuple;
+						if (d != NULL &&
+							xlhdr->datalen <= 2 * BLCKSZ - SizeofHeapTupleHeader)
+						{
+							memset(htup, 0, SizeofHeapTupleHeader);
+							memcpy((char *) htup + SizeofHeapTupleHeader, ptr, xlhdr->datalen);
+							htup->t_infomask2 = xlhdr->t_infomask2;
+							htup->t_infomask = xlhdr->t_infomask;
+							htup->t_hoff = xlhdr->t_hoff;
+							we_batch_row(bb, d, row, htup);
+						}
+						row++;
+						ptr += xlhdr->datalen;
+					}
+				}
+				if (bb != NULL)
+				{
+					bb->b.nrows = (d != NULL) ? row : xlrec->ntuples;
+					we_batch_commit(ctx, bb);
+				}
+				return;
+			}
+		}
 
 		if (ptr == NULL)
 		{
@@ -1869,6 +2271,7 @@ walextract_context_free(WalExtractContext *ctx)
 	if (ctx)
 	{
 		we_buf_free_all(ctx);
+		we_bbuf_free_all(ctx);
 		free(ctx);
 	}
 }
@@ -1878,16 +2281,21 @@ walextract_context_reset(WalExtractContext *ctx)
 {
 	WalExtractEmit cb = ctx->emit_cb;
 	void	   *sink = ctx->emit_sink;
+	WalExtractEmitBatch bcb = ctx->batch_emit_cb;
+	void	   *bsink = ctx->batch_emit_sink;
 	bool		boot = ctx->do_bootstrap;
 	Oid			tdb = ctx->target_db;
 	WalExtractRenderMode mode = ctx->render_mode;
 	char		pg[1024];
 
 	we_buf_free_all(ctx);		/* drop any open-transaction buffer first */
+	we_bbuf_free_all(ctx);
 	strlcpy(pg, ctx->pgdata, sizeof(pg));
 	memset(ctx, 0, sizeof(*ctx));
 	ctx->emit_cb = cb;
 	ctx->emit_sink = sink;
+	ctx->batch_emit_cb = bcb;
+	ctx->batch_emit_sink = bsink;
 	ctx->do_bootstrap = boot;
 	ctx->target_db = tdb;
 	ctx->render_mode = mode;
@@ -1899,6 +2307,25 @@ walextract_set_emit(WalExtractContext *ctx, WalExtractEmit cb, void *sink)
 {
 	ctx->emit_cb = cb;
 	ctx->emit_sink = sink;
+}
+
+Size
+walextract_buf_peak(const WalExtractContext *ctx)
+{
+	return ctx->buf_bytes_peak;
+}
+
+Size
+walextract_bbuf_peak(const WalExtractContext *ctx)
+{
+	return ctx->bbuf_bytes_peak;
+}
+
+void
+walextract_set_emit_batch(WalExtractContext *ctx, WalExtractEmitBatch cb, void *sink)
+{
+	ctx->batch_emit_cb = cb;
+	ctx->batch_emit_sink = sink;
 }
 
 void
