@@ -17,6 +17,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/pg_authid.h"
 #include "utils/acl.h"
+#include "port/pg_bitutils.h"
 
 #include "walextract_core.h"
 
@@ -65,6 +66,164 @@ sink_emit(const ChangeEvent *ev, void *sink)
 	else
 		values[10] = LSNGetDatum(ev->commit_lsn);
 	tuplestore_putvalues(s->tupstore, s->tupdesc, values, nulls);
+}
+
+/* ===================== machine-path (ChangeBatch) harness ===================== */
+
+typedef struct BatchSinkCtx
+{
+	Tuplestorestate *tupstore;	/* detail mode only */
+	TupleDesc	tupdesc;
+	bool		detail;			/* true: emit per-batch rows; false: accumulate only */
+	int64		n_batches;
+	int64		total_rows;
+	int64		total_payload;	/* bytes copied into batch arenas */
+	int64		total_nulls;	/* null cells (row x col) */
+	bool		any_toast;
+} BatchSinkCtx;
+
+/* count set null bits in a vector over [0, nrows) */
+static int64
+vec_null_count(const ChangeVector *v, int nrows)
+{
+	int64		c = 0;
+	int			full = nrows / 64;
+	int			rem = nrows % 64;
+	int			w;
+
+	for (w = 0; w < full; w++)
+		c += pg_popcount64(v->nullbits[w]);
+	if (rem)
+		c += pg_popcount64(v->nullbits[full] & (((uint64) 1 << rem) - 1));
+	return c;
+}
+
+/* bytes actually copied for the batch, and total null cells */
+static void
+batch_metrics(const ChangeBatch *b, int64 *payload, int64 *nulls)
+{
+	int64		p = 0;
+	int64		n = 0;
+	int			j;
+
+	if (!b->schema_missing && b->cols != NULL)
+	{
+		for (j = 0; j < b->ncols; j++)
+		{
+			const ChangeVector *v = &b->cols[j];
+			int64		vnull = vec_null_count(v, b->nrows);
+
+			n += vnull;
+			if (v->attlen > 0)
+				p += (int64) (b->nrows - vnull) * v->attlen;	/* fixed: non-null * len */
+			else
+				p += v->varoff ? (int64) v->varoff[b->nrows] : 0;	/* varlena: blob len */
+		}
+	}
+	*payload = p;
+	*nulls = n;
+}
+
+static void
+batch_sink(const ChangeBatch *b, void *sink)
+{
+	BatchSinkCtx *s = (BatchSinkCtx *) sink;
+	int64		payload;
+	int64		nulls;
+
+	batch_metrics(b, &payload, &nulls);
+	s->n_batches++;
+	s->total_rows += b->nrows;
+	s->total_payload += payload;
+	s->total_nulls += nulls;
+	if (b->has_external_toast)
+		s->any_toast = true;
+
+	if (s->detail)
+	{
+		Datum		values[11];
+		bool		isnull[11];
+
+		memset(isnull, 0, sizeof(isnull));
+		values[0] = LSNGetDatum(b->record_lsn);
+		if (b->commit_lsn == InvalidXLogRecPtr)
+			isnull[1] = true;
+		else
+			values[1] = LSNGetDatum(b->commit_lsn);
+		values[2] = TransactionIdGetDatum(b->xid);
+		values[3] = ObjectIdGetDatum(b->relfilenode);
+		values[4] = ObjectIdGetDatum(b->rel_oid);
+		values[5] = Int32GetDatum(b->nrows);
+		values[6] = Int32GetDatum(b->ncols);
+		values[7] = BoolGetDatum(b->schema_missing);
+		values[8] = BoolGetDatum(b->has_external_toast);
+		values[9] = Int64GetDatum(payload);
+		values[10] = Int64GetDatum(nulls);
+		tuplestore_putvalues(s->tupstore, s->tupdesc, values, isnull);
+	}
+}
+
+/* shared WAL scan in batch mode; ERRORs (fail-closed) if the core stops */
+static XLogReaderState *InitXLogReaderState(XLogRecPtr lsn);	/* defined below */
+static XLogRecord *ReadNextXLogRecord(XLogReaderState *xlogreader);	/* defined below */
+
+static void
+scan_batches(XLogRecPtr start_lsn, XLogRecPtr end_lsn, BatchSinkCtx *bs,
+			 int64 *ev_peak, int64 *b_peak)
+{
+	XLogReaderState *xlogreader;
+	WalExtractContext *wectx;
+	XLogRecPtr	curr_flush;
+
+	if (!has_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to mine WAL"),
+				 errdetail("Only roles with privileges of the \"pg_read_server_files\" role may use this function.")));
+
+	curr_flush = GetFlushRecPtr(NULL);
+	if (end_lsn == InvalidXLogRecPtr || end_lsn > curr_flush)
+		end_lsn = curr_flush;
+	if (start_lsn > end_lsn)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("start_lsn %X/%08X is greater than end_lsn %X/%08X",
+						LSN_FORMAT_ARGS(start_lsn), LSN_FORMAT_ARGS(end_lsn))));
+
+	wectx = walextract_context_create();
+	if (wectx == NULL)
+		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory")));
+	walextract_set_emit_batch(wectx, batch_sink, bs);	/* clears event sink */
+	walextract_set_pgdata(wectx, DataDir);
+	walextract_set_bootstrap(wectx, false);
+	walextract_set_target_db(wectx, MyDatabaseId);
+
+	xlogreader = InitXLogReaderState(start_lsn);
+	while (ReadNextXLogRecord(xlogreader) && xlogreader->EndRecPtr <= end_lsn)
+	{
+		CHECK_FOR_INTERRUPTS();
+		walextract_record(wectx, xlogreader);
+		if (walextract_failed(wectx))
+			break;
+	}
+
+	if (walextract_failed(wectx))
+	{
+		const char *msg = walextract_status_message(wectx);
+
+		pfree(xlogreader->private_data);
+		XLogReaderFree(xlogreader);
+		walextract_context_free(wectx);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("walextract batch mode stopped: %s", msg)));
+	}
+
+	*ev_peak = (int64) walextract_buf_peak(wectx);
+	*b_peak = (int64) walextract_bbuf_peak(wectx);
+	pfree(xlogreader->private_data);
+	XLogReaderFree(xlogreader);
+	walextract_context_free(wectx);
 }
 
 /* verbatim from pg_walinspect: build a reader over local cluster WAL */
@@ -209,4 +368,183 @@ walextract_wal2sql(PG_FUNCTION_ARGS)
 	XLogReaderFree(xlogreader);
 	walextract_context_free(wectx);
 	return (Datum) 0;
+}
+
+/* ----- machine-path SRFs / selftest ----- */
+
+/*
+ * EVENT+NULL baseline: event mode (WX_RENDER_EVENT, raw payload buffered) with
+ * a counting-only sink -- no SQL rendering, no tuplestore materialization.  This
+ * is the fair machine-vs-machine comparison point for the batch path.
+ */
+typedef struct EvCountCtx
+{
+	int64		n;
+} EvCountCtx;
+
+static void
+event_count_sink(const ChangeEvent *ev, void *sink)
+{
+	((EvCountCtx *) sink)->n++;
+}
+
+PG_FUNCTION_INFO_V1(walextract_wal2event_count);
+Datum
+walextract_wal2event_count(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	start_lsn = PG_GETARG_LSN(0);
+	XLogRecPtr	end_lsn = PG_GETARG_LSN(1);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	XLogReaderState *xlogreader;
+	WalExtractContext *wectx;
+	XLogRecPtr	curr_flush;
+	EvCountCtx	ec = {0};
+	Datum		values[2];
+	bool		isnull[2] = {false, false};
+
+	if (!has_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to mine WAL")));
+
+	curr_flush = GetFlushRecPtr(NULL);
+	if (end_lsn == InvalidXLogRecPtr || end_lsn > curr_flush)
+		end_lsn = curr_flush;
+	if (start_lsn > end_lsn)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("start_lsn is greater than end_lsn")));
+
+	InitMaterializedSRF(fcinfo, 0);
+	wectx = walextract_context_create();
+	if (wectx == NULL)
+		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory")));
+	walextract_set_render_mode(wectx, WX_RENDER_EVENT);	/* raw payload, no SQL */
+	walextract_set_emit(wectx, event_count_sink, &ec);
+	walextract_set_pgdata(wectx, DataDir);
+	walextract_set_bootstrap(wectx, false);
+	walextract_set_target_db(wectx, MyDatabaseId);
+
+	xlogreader = InitXLogReaderState(start_lsn);
+	while (ReadNextXLogRecord(xlogreader) && xlogreader->EndRecPtr <= end_lsn)
+	{
+		CHECK_FOR_INTERRUPTS();
+		walextract_record(wectx, xlogreader);
+		if (walextract_failed(wectx))
+			break;
+	}
+	if (walextract_failed(wectx))
+	{
+		const char *msg = walextract_status_message(wectx);
+
+		pfree(xlogreader->private_data);
+		XLogReaderFree(xlogreader);
+		walextract_context_free(wectx);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("walextract event mode stopped: %s", msg)));
+	}
+
+	values[0] = Int64GetDatum(ec.n);
+	values[1] = Int64GetDatum((int64) walextract_buf_peak(wectx));
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, isnull);
+
+	pfree(xlogreader->private_data);
+	XLogReaderFree(xlogreader);
+	walextract_context_free(wectx);
+	return (Datum) 0;
+}
+
+PG_FUNCTION_INFO_V1(walextract_wal2batch);
+Datum
+walextract_wal2batch(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	start_lsn = PG_GETARG_LSN(0);
+	XLogRecPtr	end_lsn = PG_GETARG_LSN(1);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	BatchSinkCtx bs;
+	int64		ev_peak,
+				b_peak;
+
+	InitMaterializedSRF(fcinfo, 0);
+	memset(&bs, 0, sizeof(bs));
+	bs.tupstore = rsinfo->setResult;
+	bs.tupdesc = rsinfo->setDesc;
+	bs.detail = true;
+	scan_batches(start_lsn, end_lsn, &bs, &ev_peak, &b_peak);
+	return (Datum) 0;
+}
+
+PG_FUNCTION_INFO_V1(walextract_batch_stats);
+Datum
+walextract_batch_stats(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	start_lsn = PG_GETARG_LSN(0);
+	XLogRecPtr	end_lsn = PG_GETARG_LSN(1);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	BatchSinkCtx bs;
+	int64		ev_peak = 0,
+				b_peak = 0;
+	Datum		values[7];
+	bool		isnull[7];
+
+	InitMaterializedSRF(fcinfo, 0);
+	memset(&bs, 0, sizeof(bs));
+	bs.detail = false;
+	scan_batches(start_lsn, end_lsn, &bs, &ev_peak, &b_peak);
+
+	memset(isnull, 0, sizeof(isnull));
+	values[0] = Int64GetDatum(bs.n_batches);
+	values[1] = Int64GetDatum(bs.total_rows);
+	values[2] = Int64GetDatum(bs.total_payload);
+	values[3] = Int64GetDatum(bs.total_nulls);
+	values[4] = BoolGetDatum(bs.any_toast);
+	values[5] = Int64GetDatum(ev_peak);
+	values[6] = Int64GetDatum(b_peak);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, isnull);
+	return (Datum) 0;
+}
+
+static const char *
+mode_name(WalExtractActiveMode m)
+{
+	switch (m)
+	{
+		case WX_MODE_EVENT:
+			return "event";
+		case WX_MODE_BATCH:
+			return "batch";
+		default:
+			return "none";
+	}
+}
+
+/*
+ * Proves the single-active contract WITHOUT touching opaque context state:
+ * installing one sink clears the other.  Expected:
+ *   after_set_event=event;after_set_batch=batch
+ */
+PG_FUNCTION_INFO_V1(walextract_mode_selftest);
+Datum
+walextract_mode_selftest(PG_FUNCTION_ARGS)
+{
+	WalExtractContext *c = walextract_context_create();
+	char		buf[80];
+	const char *a,
+			   *b;
+
+	if (c == NULL)
+		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory")));
+
+	walextract_set_emit_batch(c, batch_sink, NULL);
+	walextract_set_emit(c, sink_emit, NULL);	/* must clear batch -> event */
+	a = mode_name(walextract_active_mode(c));
+
+	walextract_set_emit(c, sink_emit, NULL);
+	walextract_set_emit_batch(c, batch_sink, NULL); /* must clear event -> batch */
+	b = mode_name(walextract_active_mode(c));
+
+	walextract_context_free(c);
+	snprintf(buf, sizeof(buf), "after_set_event=%s;after_set_batch=%s", a, b);
+	PG_RETURN_TEXT_P(cstring_to_text(buf));
 }
