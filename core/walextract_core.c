@@ -813,6 +813,31 @@ mine_relname_get(WalExtractContext *ctx, Oid relfile)
 }
 
 /*
+ * Is this relfilenode a TOAST relation (pg_class.relkind == 't')?  Learned from
+ * mined pg_class.  TOAST chunks are internal storage, not user DML: they must
+ * never appear in the machine/event stream as user rows.  An unknown relfilenode
+ * returns false, so the caller falls back to its normal user/system/catalog
+ * handling (conservative: we only suppress relations we positively know are TOAST).
+ */
+static bool
+mine_is_toast_rel(WalExtractContext *ctx, Oid relfile)
+{
+	uint32		h = (relfile * 131u) % MINE_NREL;
+	int			i;
+
+	for (i = 0; i < MINE_NREL; i++)
+	{
+		MineRelMapEnt *e = &ctx->relfile[(h + i) % MINE_NREL];
+
+		if (!e->used)
+			return false;
+		if (e->relfile == relfile)
+			return !e->invalid && e->relkind == RELKIND_TOASTVALUE;
+	}
+	return false;
+}
+
+/*
  * Invalidate the relfilenode->relid/name mapping for a relfilenode dropped at a
  * rewrite/TRUNCATE/DROP COMMIT boundary.  The slot is kept used (this table has
  * no tombstones) and marked invalid, so getters report it absent while the
@@ -1152,6 +1177,8 @@ mine_decode_dml(WalExtractContext *ctx, HeapTupleHeader htup, RelFileLocator *rl
 	relid = mine_relfile_get(ctx, relfile);
 	if (relfile < FirstNormalObjectId && relid == InvalidOid)
 		return;
+	if (mine_is_toast_rel(ctx, relfile))
+		return;					/* TOAST chunks are internal storage, not user rows */
 	if (relid == InvalidOid)
 		relid = relfile;		/* fresh table: relfilenode == oid */
 	relname = mine_relname_get(ctx, relfile);
@@ -1900,6 +1927,8 @@ we_is_user_stream_rel(WalExtractContext *ctx, Oid relfile)
 {
 	if (mine_is_catalog(ctx, relfile))
 		return false;
+	if (mine_is_toast_rel(ctx, relfile))
+		return false;			/* TOAST relation is internal storage, not user DML */
 	if (relfile < FirstNormalObjectId && mine_relfile_get(ctx, relfile) == InvalidOid)
 		return false;
 	return true;
@@ -2074,7 +2103,8 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		 * dictionary keeps learning.  Single-active mode: when a batch sink is
 		 * registered the event sink is absent, so no tee.
 		 */
-		if (ctx->batch_emit_cb && !mine_is_catalog(ctx, rloc.relNumber))
+		if (ctx->batch_emit_cb && !mine_is_catalog(ctx, rloc.relNumber) &&
+			!mine_is_toast_rel(ctx, rloc.relNumber))
 		{
 			Oid			relfile = rloc.relNumber;
 			Oid			relid = mine_relfile_get(ctx, relfile);
