@@ -56,6 +56,10 @@ typedef struct MineDictEnt
 typedef struct MineRelMapEnt
 {
 	bool		used;
+	bool		invalid;		/* relfilenode dropped/rewritten at a COMMIT boundary;
+								 * slot kept used to preserve the open-addressing probe
+								 * chain (this table has no tombstones), but treated as
+								 * absent by getters until a put() revives it */
 	Oid			relfile;
 	Oid			relid;
 	char		relkind;
@@ -77,6 +81,8 @@ typedef struct MineCol
 typedef struct MineRelDesc
 {
 	bool		used;
+	bool		invalid;		/* descriptor invalidated at a rewrite/drop boundary;
+								 * slot kept used to preserve the probe chain */
 	Oid			relid;
 	int			ncols;
 	MineCol		cols[80];
@@ -376,13 +382,45 @@ we_xid_in_family(TransactionId xid, TransactionId topxid,
 }
 
 /*
+ * Is this relfilenode in the COMMIT drop list (dropped/rewritten at commit),
+ * within the bound database?  Used to suppress buffered DML of a relfilenode
+ * that the same transaction destroys, so an INSERT followed by TRUNCATE/DROP in
+ * one transaction is never delivered as an apply candidate.
+ */
+static bool
+we_commit_drops_relfile(WalExtractContext *ctx, const xl_xact_parsed_commit *parsed,
+						Oid relfile)
+{
+	int			i;
+
+	if (parsed == NULL || parsed->nrels == 0 || relfile == InvalidOid)
+		return false;
+	for (i = 0; i < parsed->nrels; i++)
+	{
+		if (parsed->xlocators[i].relNumber != relfile)
+			continue;
+		if (ctx->bound_db != InvalidOid &&
+			parsed->xlocators[i].dbOid != ctx->bound_db)
+			continue;
+		return true;
+	}
+	return false;
+}
+
+/*
  * COMMIT: deliver every buffered event whose xid is in {topxid} U subxacts,
  * in WAL order, with commit_lsn set; then drop those nodes.  Walking the single
  * WAL-order list preserves within-transaction order across subtransactions.
+ *
+ * Boundary safety: an event whose relfilenode appears in this commit's drop list
+ * (parsed->xlocators) belongs to storage the same transaction destroys
+ * (TRUNCATE/DROP/rewrite); it is removed from the buffer WITHOUT delivery, so it
+ * never reaches the sink as an apply candidate.  parsed may be NULL (no drops).
  */
 static void
 we_flush_family(WalExtractContext *ctx, TransactionId topxid,
-				const TransactionId *subxacts, int nsub, XLogRecPtr commit_lsn)
+				const TransactionId *subxacts, int nsub, XLogRecPtr commit_lsn,
+				const xl_xact_parsed_commit *parsed)
 {
 	WeBufEvent *node = ctx->buf_head;
 	WeBufEvent *prev = NULL;
@@ -393,8 +431,12 @@ we_flush_family(WalExtractContext *ctx, TransactionId topxid,
 
 		if (we_xid_in_family(node->ev.xid, topxid, subxacts, nsub))
 		{
-			node->ev.commit_lsn = commit_lsn;
-			we_deliver(ctx, &node->ev);
+			/* deliver unless the same transaction destroys this storage */
+			if (!we_commit_drops_relfile(ctx, parsed, node->ev.relfilenode))
+			{
+				node->ev.commit_lsn = commit_lsn;
+				we_deliver(ctx, &node->ev);
+			}
 
 			if (prev == NULL)
 				ctx->buf_head = next;
@@ -711,6 +753,7 @@ mine_relfile_put(WalExtractContext *ctx, Oid relfile, Oid relid, char relkind, c
 		if (!e->used || e->relfile == relfile)
 		{
 			e->used = true;
+			e->invalid = false;		/* relfilenode reused after a drop: revive mapping */
 			e->relfile = relfile;
 			e->relid = relid;
 			e->relkind = relkind;
@@ -733,7 +776,7 @@ mine_relfile_get(WalExtractContext *ctx, Oid relfile)
 		if (!e->used)
 			return InvalidOid;
 		if (e->relfile == relfile)
-			return e->relid;
+			return e->invalid ? InvalidOid : e->relid;
 	}
 	return InvalidOid;
 }
@@ -751,9 +794,44 @@ mine_relname_get(WalExtractContext *ctx, Oid relfile)
 		if (!e->used)
 			return NULL;
 		if (e->relfile == relfile)
-			return e->relname[0] ? e->relname : NULL;
+			return (e->invalid || !e->relname[0]) ? NULL : e->relname;
 	}
 	return NULL;
+}
+
+/*
+ * Invalidate the relfilenode->relid/name mapping for a relfilenode dropped at a
+ * rewrite/TRUNCATE/DROP COMMIT boundary.  The slot is kept used (this table has
+ * no tombstones) and marked invalid, so getters report it absent while the
+ * probe chain stays intact.  Returns the prior relid (InvalidOid if untracked)
+ * and copies the prior relname into namebuf, so the caller can describe the
+ * boundary before the mapping is gone.
+ */
+static Oid
+mine_relfile_invalidate(WalExtractContext *ctx, Oid relfile, char *namebuf, size_t namecap)
+{
+	uint32		h = (relfile * 131u) % MINE_NREL;
+	int			i;
+
+	if (namebuf && namecap)
+		namebuf[0] = '\0';
+	for (i = 0; i < MINE_NREL; i++)
+	{
+		MineRelMapEnt *e = &ctx->relfile[(h + i) % MINE_NREL];
+
+		if (!e->used)
+			return InvalidOid;
+		if (e->relfile == relfile)
+		{
+			Oid			prev = e->invalid ? InvalidOid : e->relid;
+
+			if (namebuf && namecap && !e->invalid && e->relname[0])
+				strlcpy(namebuf, e->relname, namecap);
+			e->invalid = true;
+			return prev;
+		}
+	}
+	return InvalidOid;
 }
 
 /* ===================== column descriptors ===================== */
@@ -769,18 +847,56 @@ mine_desc_get(WalExtractContext *ctx, Oid relid, bool create)
 		MineRelDesc *d = &ctx->desc[(h + i) % MINE_NDESC];
 
 		if (d->used && d->relid == relid)
+		{
+			if (!d->invalid)
+				return d;
+			/* invalidated by a boundary: absent for lookup, revived for create */
+			if (!create)
+				return NULL;
+			d->invalid = false;
+			d->ncols = 0;
 			return d;
+		}
 		if (!d->used)
 		{
 			if (!create)
 				return NULL;
 			d->used = true;
+			d->invalid = false;
 			d->relid = relid;
 			d->ncols = 0;
 			return d;
 		}
 	}
 	return NULL;
+}
+
+/*
+ * Invalidate the column descriptor reachable for a dropped relfilenode.  For a
+ * fresh (never-rewritten) relation relfilenode == oid, so the descriptor keyed
+ * by relid == relfile is exactly the one a future stale decode of that
+ * relfilenode would resolve via the relfilenode==oid fallback in
+ * mine_decode_dml().  Poisoning it forces dictionary_missing instead of a
+ * collision mis-decode after the relfilenode value is later reused.
+ */
+static void
+mine_desc_invalidate(WalExtractContext *ctx, Oid relid)
+{
+	uint32		h = (relid * 131u) % MINE_NDESC;
+	int			i;
+
+	for (i = 0; i < MINE_NDESC; i++)
+	{
+		MineRelDesc *d = &ctx->desc[(h + i) % MINE_NDESC];
+
+		if (!d->used)
+			return;
+		if (d->relid == relid)
+		{
+			d->invalid = true;
+			return;
+		}
+	}
 }
 
 static void
@@ -1366,6 +1482,80 @@ mine_take_page_item(WalExtractContext *ctx, Page page, OffsetNumber off,
 		mine_decode_dml(ctx, h, rloc);
 }
 
+/* ===================== rewrite/truncate/drop boundary ===================== */
+
+/*
+ * A COMMIT record carries, in xl_xact_parsed_commit.xlocators, the set of
+ * relfilenodes this transaction drops at commit.  This is the authoritative
+ * boundary signal for TRUNCATE, DROP, CLUSTER/VACUUM FULL and rewriting ALTER
+ * under any wal_level (under wal_level=replica there is no XLOG_HEAP_TRUNCATE
+ * record at all; the destructive effect is realized through this drop list plus
+ * a pg_class relfilenode swap).
+ *
+ * For every dropped relfilenode we were tracking we (1) invalidate its
+ * relfilenode->relid/name mapping and the descriptor reachable via the
+ * relfilenode==oid fallback, so no later record decodes through a stale mapping
+ * after the relfilenode value is reused, and (2) emit one explicit forensic
+ * boundary event.  This runs only on COMMIT, only when nrels > 0, and is
+ * O(nrels) with O(1) per-locator invalidation; it adds no per-row cost to the
+ * INSERT/EVENT hot path.
+ */
+static void
+we_apply_drop_boundaries(WalExtractContext *ctx, xl_xact_parsed_commit *parsed,
+						 XLogRecPtr commit_lsn, TransactionId topxid)
+{
+	int			i;
+
+	for (i = 0; i < parsed->nrels; i++)
+	{
+		RelFileLocator loc = parsed->xlocators[i];
+		Oid			relfile = loc.relNumber;
+		Oid			prev;
+		char		oldname[64];
+		ChangeEvent ev;
+		char		op_text[256];
+		size_t		pos = 0;
+
+		/* single-db scope: only act within the bound database */
+		if (ctx->bound_db != InvalidOid && loc.dbOid != ctx->bound_db)
+			continue;
+
+		/*
+		 * Invalidate unconditionally (cheap, O(1)); this upholds the invariant
+		 * even for a relfilenode learned only partially.  Capture the prior
+		 * identity first so we can describe the boundary.
+		 */
+		prev = mine_relfile_invalidate(ctx, relfile, oldname, sizeof(oldname));
+		mine_desc_invalidate(ctx, relfile);
+
+		/* surface a boundary only for relfilenodes we were actually tracking */
+		if (prev == InvalidOid && oldname[0] == '\0')
+			continue;
+
+		memset(&ev, 0, sizeof(ev));
+		ev.record_lsn = commit_lsn;
+		ev.commit_lsn = commit_lsn;
+		ev.xid = topxid;
+		ev.db_oid = loc.dbOid;
+		ev.rel_oid = prev;
+		ev.relfilenode = relfile;
+		ev.relname = oldname[0] ? oldname : NULL;
+		ev.op = WCO_DDL_CATALOG;
+		ev.complete = false;
+		ev_add_reason(&ev, WER_REWRITE_BOUNDARY);
+		we_appendf(op_text, sizeof(op_text), &pos,
+				   "-- boundary: RELFILENODE_DROP/REWRITE relfilenode=%u db=%u",
+				   relfile, loc.dbOid);
+		if (oldname[0])
+		{
+			we_appendf(op_text, sizeof(op_text), &pos, " was rel ");
+			we_append_text_oneline(op_text, sizeof(op_text), &pos, oldname);
+		}
+		ev.op_text = op_text;
+		we_deliver(ctx, &ev);
+	}
+}
+
 /* ===================== record dispatch ===================== */
 
 void
@@ -1400,8 +1590,16 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 			xl_xact_parsed_commit parsed;
 
 			ParseCommitRecord(xact_info, xlrec, &parsed);
+			/*
+			 * Boundary safety: flush inspects parsed.xlocators and suppresses
+			 * buffered DML of any relfilenode this transaction drops/rewrites,
+			 * so a same-transaction INSERT+TRUNCATE/DROP is not delivered as an
+			 * apply candidate.  The boundary pass then invalidates the stale
+			 * mapping for future records and emits the explicit boundary event.
+			 */
 			we_flush_family(ctx, topxid, parsed.subxacts, parsed.nsubxacts,
-							record->ReadRecPtr);
+							record->ReadRecPtr, &parsed);
+			we_apply_drop_boundaries(ctx, &parsed, record->ReadRecPtr, topxid);
 		}
 		else if (xact_op == XLOG_XACT_ABORT)
 		{

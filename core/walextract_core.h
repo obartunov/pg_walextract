@@ -28,6 +28,7 @@ typedef enum WalChangeOp
 #define WER_TOO_MANY_COLUMNS	"too_many_columns"
 #define WER_VALUE_TRUNCATED		"value_truncated"
 #define WER_CATALOG_TRUNCATED	"catalog_truncated"
+#define WER_REWRITE_BOUNDARY	"rewrite_or_drop_boundary"
 
 #define WALEXTRACT_MAX_REASONS	6
 #define WALEXTRACT_MAX_COLS		80
