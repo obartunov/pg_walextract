@@ -170,6 +170,7 @@ struct WalExtractContext
 	Size		bbuf_bytes;
 	Size		buf_bytes_peak;		/* peak event-buffer bytes (commit-buffer memory) */
 	Size		bbuf_bytes_peak;	/* peak batch-buffer bytes */
+	const char *batch_unsupported_reason;	/* WEB_* set with WALEXTRACT_FATAL_UNSUPPORTED_BATCH */
 };
 
 /* ===================== small helpers ===================== */
@@ -1753,6 +1754,15 @@ we_batch_row(WeBufBatch *bb, MineRelDesc *d, int row, HeapTupleHeader htup)
 		}
 		else
 		{
+			/*
+			 * varlena/cstring: copy the inline datum verbatim.  An on-disk
+			 * TOAST pointer is copied as-is (VARSIZE_ANY = pointer length, fully
+			 * present in WAL) and the batch is flagged partial -- TOAST
+			 * reassembly is out of P2A scope, but the value is never silently
+			 * presented as complete.
+			 */
+			if (c->attlen == -1 && VARATT_IS_EXTERNAL(vptr))
+				bb->b.has_external_toast = true;
 			rawlen = (c->attlen == -1) ? VARSIZE_ANY(vptr) : (Size) strlen(vptr) + 1;
 			memcpy(v->varblob + v->varoff[row], vptr, rawlen);
 			v->varoff[row + 1] = v->varoff[row] + (uint32) rawlen;
@@ -1879,6 +1889,37 @@ we_bbuf_free_all(WalExtractContext *ctx)
 	ctx->bbuf_bytes = 0;
 }
 
+/*
+ * Would this relfilenode's user DML be part of the machine output stream?
+ * Mirrors mine_decode_dml()'s focus: catalogs are dictionary-learning (not user
+ * stream), and an untracked system relfilenode is a DDL side effect.  Used so
+ * the batch-mode fail-closed guards fire only for real user records.
+ */
+static bool
+we_is_user_stream_rel(WalExtractContext *ctx, Oid relfile)
+{
+	if (mine_is_catalog(ctx, relfile))
+		return false;
+	if (relfile < FirstNormalObjectId && mine_relfile_get(ctx, relfile) == InvalidOid)
+		return false;
+	return true;
+}
+
+/*
+ * Batch mode is a machine stream and must never silently drop a user record it
+ * cannot represent.  Record a fatal status + stable reason; walextract_record()
+ * stops processing on the next entry and the frontend surfaces it as an error.
+ */
+static void
+we_batch_unsupported(WalExtractContext *ctx, const char *reason)
+{
+	if (ctx->status == WALEXTRACT_OK)
+	{
+		ctx->status = WALEXTRACT_FATAL_UNSUPPORTED_BATCH;
+		ctx->batch_unsupported_reason = reason;
+	}
+}
+
 /* ===================== record dispatch ===================== */
 
 void
@@ -1893,6 +1934,9 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 
 	if (ctx->status != WALEXTRACT_OK)
 		return;					/* failed closed: stop processing */
+
+	/* single-active mode invariant: event XOR batch, never a tee (see header) */
+	Assert(!(ctx->emit_cb && ctx->batch_emit_cb));
 
 	/*
 	 * Transaction boundary: a COMMIT delivers the transaction's buffered
@@ -1986,6 +2030,18 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 	{
 		xl_heap_insert *xlrec = (xl_heap_insert *) XLogRecGetData(record);
 		char	   *blkdata = XLogRecGetBlockData(record, 0, &datalen);
+
+		/*
+		 * Batch mode covers only HEAP2 MULTI_INSERT.  A single user INSERT
+		 * would otherwise be buffered as a ChangeEvent and then no-op delivered
+		 * (event sink is absent in batch mode), silently dropping a user row.
+		 * Single-INSERT coalescing is P3; until then, fail closed.
+		 */
+		if (ctx->batch_emit_cb && we_is_user_stream_rel(ctx, rloc.relNumber))
+		{
+			we_batch_unsupported(ctx, WEB_SINGLE_INSERT_UNSUPPORTED);
+			return;
+		}
 
 		if (blkdata == NULL)
 		{
@@ -2129,6 +2185,13 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		size_t		pos = 0;
 		bool		catalog_trunc = false;
 
+		/* batch mode: user UPDATE is not representable as a ChangeBatch -> fail closed */
+		if (ctx->batch_emit_cb && we_is_user_stream_rel(ctx, rloc.relNumber))
+		{
+			we_batch_unsupported(ctx, WEB_UPDATE_UNSUPPORTED);
+			return;
+		}
+
 		if (!mine_is_catalog(ctx, rloc.relNumber))
 			return;				/* user UPDATE not implemented (by design) */
 		if (XLogRecGetBlockTagExtended(record, 1, &r2, &f2, &b2, NULL))
@@ -2222,6 +2285,13 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		xl_heap_delete *xlrec = (xl_heap_delete *) XLogRecGetData(record);
 		MineDictEnt *e;
 
+		/* batch mode: user DELETE is not representable as a ChangeBatch -> fail closed */
+		if (ctx->batch_emit_cb && we_is_user_stream_rel(ctx, rloc.relNumber))
+		{
+			we_batch_unsupported(ctx, WEB_DELETE_UNSUPPORTED);
+			return;
+		}
+
 		if (!mine_is_catalog(ctx, rloc.relNumber))
 			return;				/* user DELETE not implemented (by design) */
 		e = mine_dict_find(ctx, rloc.relNumber, blk, xlrec->offnum);
@@ -2307,12 +2377,26 @@ walextract_set_emit(WalExtractContext *ctx, WalExtractEmit cb, void *sink)
 {
 	ctx->emit_cb = cb;
 	ctx->emit_sink = sink;
+	/* single-active mode: installing the event sink disables batch mode */
+	ctx->batch_emit_cb = NULL;
+	ctx->batch_emit_sink = NULL;
 }
 
 Size
 walextract_buf_peak(const WalExtractContext *ctx)
 {
 	return ctx->buf_bytes_peak;
+}
+
+WalExtractActiveMode
+walextract_active_mode(const WalExtractContext *ctx)
+{
+	/* single-active mode is enforced by the setters; report the live sink */
+	if (ctx->batch_emit_cb != NULL)
+		return WX_MODE_BATCH;
+	if (ctx->emit_cb != NULL)
+		return WX_MODE_EVENT;
+	return WX_MODE_NONE;
 }
 
 Size
@@ -2326,6 +2410,9 @@ walextract_set_emit_batch(WalExtractContext *ctx, WalExtractEmitBatch cb, void *
 {
 	ctx->batch_emit_cb = cb;
 	ctx->batch_emit_sink = sink;
+	/* single-active mode: installing the batch sink disables event mode */
+	ctx->emit_cb = NULL;
+	ctx->emit_sink = NULL;
 }
 
 void
@@ -2390,6 +2477,10 @@ walextract_status_message(const WalExtractContext *ctx)
 			return "prepared (two-phase) transaction records are not supported";
 		case WALEXTRACT_FATAL_ABORTED_DDL:
 			return "aborted transaction had already mutated the mined dictionary (non-transactional dictionary cannot be rolled back)";
+		case WALEXTRACT_FATAL_UNSUPPORTED_BATCH:
+			return ctx->batch_unsupported_reason
+				? ctx->batch_unsupported_reason
+				: "batch mode encountered an unsupported user-DML record";
 	}
 	return "unknown";
 }

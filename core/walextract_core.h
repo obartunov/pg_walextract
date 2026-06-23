@@ -30,6 +30,17 @@ typedef enum WalChangeOp
 #define WER_CATALOG_TRUNCATED	"catalog_truncated"
 #define WER_REWRITE_BOUNDARY	"rewrite_or_drop_boundary"
 
+/*
+ * Batch-mode (machine path) unsupported-record reasons.  Batch mode is a
+ * machine stream and must never silently return a partial stream: a user-DML
+ * record the batch path cannot yet represent fails closed with one of these as
+ * the status reason (see walextract_status_message).  String identity is
+ * significant; do not strdup.
+ */
+#define WEB_SINGLE_INSERT_UNSUPPORTED	"batch_single_insert_unsupported"
+#define WEB_UPDATE_UNSUPPORTED			"batch_update_unsupported"
+#define WEB_DELETE_UNSUPPORTED			"batch_delete_unsupported"
+
 #define WALEXTRACT_MAX_REASONS	6
 #define WALEXTRACT_MAX_COLS		80
 
@@ -107,6 +118,10 @@ typedef struct ChangeBatch
 	int			ncols;			/* 0 when schema_missing */
 	int			nrows;
 	bool		schema_missing;	/* no descriptor: rows counted, no typed columns */
+	bool		has_external_toast;	/* >=1 value is an on-disk TOAST pointer (inline
+									 * datum copied verbatim, NOT reassembled): the
+									 * batch is PARTIAL and the consumer must detoast.
+									 * TOAST reassembly is out of P2A scope. */
 	ChangeVector *cols;			/* ncols vectors, arena-owned (NULL if schema_missing) */
 } ChangeBatch;
 
@@ -124,7 +139,10 @@ typedef enum WalExtractStatus
 	WALEXTRACT_FATAL_BUFFER_OVERFLOW,	/* per-call buffered-event cap hit */
 	WALEXTRACT_FATAL_OOM,				/* malloc failed while buffering */
 	WALEXTRACT_FATAL_TWOPHASE,			/* prepared-xact record: out of scope in v0 */
-	WALEXTRACT_FATAL_ABORTED_DDL		/* aborted txn already mutated the (non-txnal) dictionary */
+	WALEXTRACT_FATAL_ABORTED_DDL,		/* aborted txn already mutated the (non-txnal) dictionary */
+	WALEXTRACT_FATAL_UNSUPPORTED_BATCH	/* batch mode hit a user-DML record it cannot
+										 * represent (single INSERT / UPDATE / DELETE);
+										 * fail closed instead of dropping it silently */
 } WalExtractStatus;
 
 typedef enum WalExtractRenderMode
@@ -137,12 +155,27 @@ typedef struct WalExtractContext WalExtractContext;
 typedef void (*WalExtractEmit) (const ChangeEvent *ev, void *sink);
 typedef void (*WalExtractEmitBatch) (const ChangeBatch *b, void *sink);
 
+/* which output sink is currently active (single-active: never both) */
+typedef enum WalExtractActiveMode
+{
+	WX_MODE_NONE = 0,
+	WX_MODE_EVENT,
+	WX_MODE_BATCH
+} WalExtractActiveMode;
+
 extern WalExtractContext *walextract_context_create(void);
 extern void walextract_context_free(WalExtractContext *ctx);
 extern void walextract_context_reset(WalExtractContext *ctx);
 
+/*
+ * Output sink selection is single-active: event mode XOR batch mode.  There is
+ * no tee in P2A.  Each setter installs its own sink and CLEARS the other, so a
+ * context delivers either ChangeEvents (forensic/SRF) or ChangeBatches (machine
+ * path), never both.  walextract_record() asserts the invariant defensively.
+ */
 extern void walextract_set_emit(WalExtractContext *ctx, WalExtractEmit cb, void *sink);
 extern void walextract_set_emit_batch(WalExtractContext *ctx, WalExtractEmitBatch cb, void *sink);
+extern WalExtractActiveMode walextract_active_mode(const WalExtractContext *ctx);
 extern Size walextract_buf_peak(const WalExtractContext *ctx);
 extern Size walextract_bbuf_peak(const WalExtractContext *ctx);
 extern void walextract_set_pgdata(WalExtractContext *ctx, const char *pgdata);
