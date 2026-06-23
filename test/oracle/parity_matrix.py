@@ -66,8 +66,15 @@ def timed(a, sql, iters=3):
     return (min(times) if times else None), None
 
 
-def oracle(a, s0, s1):
-    """Run pg_waldump over [s0,s1]; return (summary dict, wall_ms)."""
+def toast_relfilenodes(a):
+    """relfilenodes that pg_class marks as TOAST (relkind='t'): internal storage."""
+    rows, _ = psql_scalar_rows(a, "SELECT relfilenode FROM pg_class WHERE relkind='t' AND relfilenode<>0")
+    return set(int(r[0]) for r in rows) if rows else set()
+
+
+def oracle(a, s0, s1, toast_set):
+    """Run pg_waldump over [s0,s1]; return (summary dict, wall_ms).
+    Heap records into a TOAST relfilenode are internal storage, not user DML."""
     t0 = time.perf_counter()
     p = run([a.waldump, "-p", a.pgdata, "--start", s0, "--end", s1])
     wall = (time.perf_counter() - t0) * 1000.0
@@ -75,6 +82,7 @@ def oracle(a, s0, s1):
     cls = {}                         # "Rmgr|RECTYPE" -> count
     u = dict(mi_rec=0, mi_rows=0, ins=0, upd=0, dele=0)
     c = dict(mi_rec=0, mi_rows=0, ins=0, upd=0, dele=0)
+    toast_ins = 0
     forensic = 0
     for line in out.splitlines():
         mr, md = RE_RMGR.search(line), RE_DESC.search(line)
@@ -85,13 +93,20 @@ def oracle(a, s0, s1):
         cls[rmgr + "|" + desc] = cls.get(rmgr + "|" + desc, 0) + 1
         relm = RE_REL.search(line)
         relfile = int(relm.group(1)) if relm else None
-        is_user = relfile is not None and relfile >= FIRST_NORMAL_OID
+        is_toast = relfile is not None and relfile in toast_set
+        is_user = relfile is not None and relfile >= FIRST_NORMAL_OID and not is_toast
         if rmgr == "Heap2" and head == "MULTI_INSERT":
             nt = int(RE_NTUP.search(line).group(1)) if RE_NTUP.search(line) else 0
-            d = u if is_user else c
-            d["mi_rec"] += 1; d["mi_rows"] += nt
+            if is_toast:
+                toast_ins += nt
+            else:
+                d = u if is_user else c
+                d["mi_rec"] += 1; d["mi_rows"] += nt
         elif rmgr == "Heap" and head == "INSERT":
-            (u if is_user else c)["ins"] += 1
+            if is_toast:
+                toast_ins += 1
+            else:
+                (u if is_user else c)["ins"] += 1
         elif rmgr == "Heap" and head in ("UPDATE", "HOT_UPDATE"):
             (u if is_user else c)["upd"] += 1
         elif rmgr == "Heap" and head == "DELETE":
@@ -100,7 +115,7 @@ def oracle(a, s0, s1):
             pass
         else:
             forensic += 1
-    return dict(cls=cls, user=u, cat=c, forensic=forensic, raw=out), wall
+    return dict(cls=cls, user=u, cat=c, toast=toast_ins, forensic=forensic, raw=out), wall
 
 
 def short_classes(o):
@@ -116,6 +131,8 @@ def short_classes(o):
         parts.append("DELETE=%d" % u["dele"])
     if not parts:
         parts.append("no user DML")
+    if o.get("toast"):
+        parts.append("toast-internal=%d" % o["toast"])
     parts.append("forensic+cat=%d" % (o["forensic"] + sum(o["cat"].values())))
     return ", ".join(parts)
 
@@ -226,9 +243,10 @@ def main():
     if ranges is None:
         print("could not read wx_ranges:", err); sys.exit(1)
 
+    toast_set = toast_relfilenodes(a)
     rows = []
     for wl, s0, s1, kind, walb in ranges:
-        o, owall = oracle(a, s0, s1)
+        o, owall = oracle(a, s0, s1, toast_set)
         rows.append((wl, kind, s0, s1, int(float(walb)), o))
 
     if a.mode in ("correctness", "both"):
