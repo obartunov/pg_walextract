@@ -141,4 +141,28 @@ COPY wabulk FROM '/tmp/wx_src200.dat';
 INSERT INTO wx_ranges(workload,s0,s1,kind,note)
   SELECT 'A-bulk', :'s', pg_current_wal_lsn(), 'copy_capacity', 'COPY 200k MULTI_INSERT';
 
+-- M: pre-existing NORMAL table; CREATE before range, COPY inside range.
+-- Unknown to the dictionary unless primed from live catalogs.
+CREATE TABLE wm(a int, b int, c int);
+INSERT INTO wm SELECT g, g*2, g*3 FROM generate_series(1,30000) g;
+COPY wm TO '/tmp/wx_wm.dat';
+TRUNCATE wm;
+SELECT pg_switch_wal() AS sw \gset
+SELECT pg_current_wal_lsn() AS s \gset
+COPY wm FROM '/tmp/wx_wm.dat';
+INSERT INTO wx_ranges(workload,s0,s1,kind,note)
+  SELECT 'M', :'s', pg_current_wal_lsn(), 'prerange_copy', 'pre-existing table COPY 30k (CREATE before range)';
+
+-- N: pre-existing EXTERNAL-TOAST table; CREATE before range, COPY inside range.
+CREATE TABLE wn(id int, big text);
+ALTER TABLE wn ALTER COLUMN big SET STORAGE EXTERNAL;
+INSERT INTO wn SELECT g, repeat(md5(g::text), 120) FROM generate_series(1,200) g;
+COPY wn TO '/tmp/wx_wn.dat';
+TRUNCATE wn;
+SELECT pg_switch_wal() AS sw \gset
+SELECT pg_current_wal_lsn() AS s \gset
+COPY wn FROM '/tmp/wx_wn.dat';
+INSERT INTO wx_ranges(workload,s0,s1,kind,note)
+  SELECT 'N', :'s', pg_current_wal_lsn(), 'prerange_toast', 'pre-existing external-TOAST COPY 200 (CREATE before range)';
+
 SELECT workload, kind, s0, s1, pg_wal_lsn_diff(s1,s0) AS wal_bytes FROM wx_ranges ORDER BY seq;

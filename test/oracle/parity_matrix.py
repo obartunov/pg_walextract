@@ -226,6 +226,46 @@ def fmt_ms(ms, err):
     return "%.2f" % ms
 
 
+def prime_contrast(a, mn_rows):
+    """Primed vs unprimed machine-stream trust for pre-range workloads (M/N).
+    primed -> decodes (TOAST internal, external TOAST flagged); unprimed ->
+    machine fail-closes unknown_dictionary, forensic path marks unknown_dictionary."""
+    if not mn_rows:
+        return
+    print("\n=== RANGE-START DICTIONARY PRIMING (pre-range workloads M/N: primed vs unprimed) ===")
+    hdr = ["WL", "prime", "event INSERT emitted/complete/unknown", "batch outcome"]
+    line = []
+    for wl, kind, s0, s1, walb, o in mn_rows:
+        for prime in ("true", "false"):
+            ev_e, _ = psql_scalar_rows(
+                a, "SELECT count(*) FROM walextract_wal2sql('%s','%s',%s) "
+                   "WHERE op='INSERT'" % (s0, s1, prime))
+            ev_c, _ = psql_scalar_rows(
+                a, "SELECT count(*) FROM walextract_wal2sql('%s','%s',%s) "
+                   "WHERE op='INSERT' AND complete" % (s0, s1, prime))
+            ev_u, _ = psql_scalar_rows(
+                a, "SELECT count(*) FROM walextract_wal2sql('%s','%s',%s) "
+                   "WHERE 'unknown_dictionary'=ANY(reasons)" % (s0, s1, prime))
+            emit = int(ev_e[0][0]) if ev_e else 0
+            comp = int(ev_c[0][0]) if ev_c else 0
+            unk = int(ev_u[0][0]) if ev_u else 0
+            b_rows, b_err = psql_scalar_rows(
+                a, "SELECT n_batches,total_rows,COALESCE(any_external_toast,false) "
+                   "FROM walextract_batch_stats('%s','%s',%s)" % (s0, s1, prime))
+            if b_err:
+                b_out = "fail-closed: " + b_err
+            else:
+                to = " +toast-flagged" if (b_rows and b_rows[0][2] == "t") else ""
+                b_out = "decoded rows=%s (%s batches)%s" % (b_rows[0][1], b_rows[0][0], to)
+            line.append([wl, prime, "emitted=%d complete=%d unknown=%d" % (emit, comp, unk), b_out])
+    widths = [max(len(str(x)) for x in [hdr[i]] + [r[i] for r in line]) for i in range(len(hdr))]
+    def pr(cols):
+        print(" | ".join(str(c).ljust(widths[i]) for i, c in enumerate(cols)))
+    pr(hdr); pr(["-" * w for w in widths])
+    for r in line:
+        pr(r)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", default="5440")
@@ -249,6 +289,11 @@ def main():
         o, owall = oracle(a, s0, s1, toast_set)
         rows.append((wl, kind, s0, s1, int(float(walb)), o))
 
+    # M/N are pre-range priming workloads: shown in their own primed-vs-unprimed
+    # section so the main matrix (A-L/J/A-bulk) stays comparable to the F2 baseline.
+    mn_rows = [r for r in rows if r[0] in ("M", "N")]
+    rows = [r for r in rows if r[0] not in ("M", "N")]
+
     if a.mode in ("correctness", "both"):
         print("\n=== CORRECTNESS / COVERAGE (oracle = pg_waldump) ===")
         hdr = ["WL", "oracle user-DML classes", "event outcome", "ev gap?",
@@ -264,6 +309,8 @@ def main():
         pr(hdr); pr(["-" * w for w in widths])
         for r in line:
             pr(r)
+
+        prime_contrast(a, mn_rows)
 
     if a.mode in ("performance", "both"):
         print("\n=== PERFORMANCE (machine path vs event vs forensic oracle) ===")
