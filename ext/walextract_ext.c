@@ -18,6 +18,7 @@
 #include "catalog/pg_authid.h"
 #include "utils/acl.h"
 #include "port/pg_bitutils.h"
+#include "executor/spi.h"
 
 #include "walextract_core.h"
 
@@ -163,13 +164,77 @@ batch_sink(const ChangeBatch *b, void *sink)
 	}
 }
 
+/*
+ * Range-start dictionary priming v0: seed the dictionary from the CURRENT
+ * database's live catalogs before decoding.  Valid only when current catalog
+ * state corresponds to the requested range (same relfilenode, not rewritten /
+ * dropped).  Startup cost only -- never per-row.
+ */
+static void
+prime_from_catalog(WalExtractContext *ctx)
+{
+	uint64		i;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		return;
+
+	if (SPI_execute("SELECT relfilenode, oid, relkind, relname "
+					"FROM pg_catalog.pg_class WHERE relfilenode <> 0", true, 0) == SPI_OK_SELECT)
+	{
+		TupleDesc	td = SPI_tuptable->tupdesc;
+
+		for (i = 0; i < SPI_processed; i++)
+		{
+			HeapTuple	t = SPI_tuptable->vals[i];
+			bool		isnull;
+			Oid			relfile = DatumGetObjectId(SPI_getbinval(t, td, 1, &isnull));
+			Oid			relid = DatumGetObjectId(SPI_getbinval(t, td, 2, &isnull));
+			char		relkind = DatumGetChar(SPI_getbinval(t, td, 3, &isnull));
+			char	   *relname = SPI_getvalue(t, td, 4);
+
+			walextract_prime_rel(ctx, relfile, relid, relkind, relname);
+			if (relname)
+				pfree(relname);
+		}
+	}
+
+	if (SPI_execute("SELECT attrelid, attnum, atttypid, attlen, attbyval, attalign, "
+					"attisdropped, attname FROM pg_catalog.pg_attribute WHERE attnum > 0",
+					true, 0) == SPI_OK_SELECT)
+	{
+		TupleDesc	td = SPI_tuptable->tupdesc;
+
+		for (i = 0; i < SPI_processed; i++)
+		{
+			HeapTuple	t = SPI_tuptable->vals[i];
+			bool		isnull;
+			Oid			attrelid = DatumGetObjectId(SPI_getbinval(t, td, 1, &isnull));
+			int16		attnum = DatumGetInt16(SPI_getbinval(t, td, 2, &isnull));
+			Oid			atttypid = DatumGetObjectId(SPI_getbinval(t, td, 3, &isnull));
+			int16		attlen = DatumGetInt16(SPI_getbinval(t, td, 4, &isnull));
+			bool		attbyval = DatumGetBool(SPI_getbinval(t, td, 5, &isnull));
+			char		attalign = DatumGetChar(SPI_getbinval(t, td, 6, &isnull));
+			bool		attisdropped = DatumGetBool(SPI_getbinval(t, td, 7, &isnull));
+			char	   *attname = SPI_getvalue(t, td, 8);
+
+			walextract_prime_attr(ctx, attrelid, attnum, atttypid, attlen,
+								   attbyval, attalign, attisdropped, attname);
+			if (attname)
+				pfree(attname);
+		}
+	}
+
+	SPI_finish();
+	walextract_set_dict_primed(ctx, true);
+}
+
 /* shared WAL scan in batch mode; ERRORs (fail-closed) if the core stops */
 static XLogReaderState *InitXLogReaderState(XLogRecPtr lsn);	/* defined below */
 static XLogRecord *ReadNextXLogRecord(XLogReaderState *xlogreader);	/* defined below */
 
 static void
 scan_batches(XLogRecPtr start_lsn, XLogRecPtr end_lsn, BatchSinkCtx *bs,
-			 int64 *ev_peak, int64 *b_peak)
+			 bool prime, int64 *ev_peak, int64 *b_peak)
 {
 	XLogReaderState *xlogreader;
 	WalExtractContext *wectx;
@@ -197,6 +262,8 @@ scan_batches(XLogRecPtr start_lsn, XLogRecPtr end_lsn, BatchSinkCtx *bs,
 	walextract_set_pgdata(wectx, DataDir);
 	walextract_set_bootstrap(wectx, false);
 	walextract_set_target_db(wectx, MyDatabaseId);
+	if (prime)
+		prime_from_catalog(wectx);
 
 	xlogreader = InitXLogReaderState(start_lsn);
 	while (ReadNextXLogRecord(xlogreader) && xlogreader->EndRecPtr <= end_lsn)
@@ -336,6 +403,8 @@ walextract_wal2sql(PG_FUNCTION_ARGS)
 	walextract_set_pgdata(wectx, DataDir);
 	walextract_set_bootstrap(wectx, false);
 	walextract_set_target_db(wectx, MyDatabaseId);
+	if (PG_GETARG_BOOL(2))
+		prime_from_catalog(wectx);
 
 	xlogreader = InitXLogReaderState(start_lsn);
 	while (ReadNextXLogRecord(xlogreader) &&
@@ -424,6 +493,8 @@ walextract_wal2event_count(PG_FUNCTION_ARGS)
 	walextract_set_pgdata(wectx, DataDir);
 	walextract_set_bootstrap(wectx, false);
 	walextract_set_target_db(wectx, MyDatabaseId);
+	if (PG_GETARG_BOOL(2))
+		prime_from_catalog(wectx);
 
 	xlogreader = InitXLogReaderState(start_lsn);
 	while (ReadNextXLogRecord(xlogreader) && xlogreader->EndRecPtr <= end_lsn)
@@ -471,7 +542,7 @@ walextract_wal2batch(PG_FUNCTION_ARGS)
 	bs.tupstore = rsinfo->setResult;
 	bs.tupdesc = rsinfo->setDesc;
 	bs.detail = true;
-	scan_batches(start_lsn, end_lsn, &bs, &ev_peak, &b_peak);
+	scan_batches(start_lsn, end_lsn, &bs, PG_GETARG_BOOL(2), &ev_peak, &b_peak);
 	return (Datum) 0;
 }
 
@@ -491,7 +562,7 @@ walextract_batch_stats(PG_FUNCTION_ARGS)
 	InitMaterializedSRF(fcinfo, 0);
 	memset(&bs, 0, sizeof(bs));
 	bs.detail = false;
-	scan_batches(start_lsn, end_lsn, &bs, &ev_peak, &b_peak);
+	scan_batches(start_lsn, end_lsn, &bs, PG_GETARG_BOOL(2), &ev_peak, &b_peak);
 
 	memset(isnull, 0, sizeof(isnull));
 	values[0] = Int64GetDatum(bs.n_batches);
