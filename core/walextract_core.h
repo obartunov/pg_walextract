@@ -24,6 +24,8 @@ typedef enum WalChangeOp
 #define WER_TOAST_EXTERNAL		"toast_external"
 #define WER_UNKNOWN_TYPE		"unknown_type"
 #define WER_DICTIONARY_MISSING	"dictionary_missing"
+#define WER_UNKNOWN_DICTIONARY	"unknown_dictionary"	/* relfilenode/relkind not in
+														 * primed/learned dictionary */
 #define WER_SCHEMA_MISSING		"schema_missing"
 #define WER_TOO_MANY_COLUMNS	"too_many_columns"
 #define WER_VALUE_TRUNCATED		"value_truncated"
@@ -40,6 +42,8 @@ typedef enum WalChangeOp
 #define WEB_SINGLE_INSERT_UNSUPPORTED	"batch_single_insert_unsupported"
 #define WEB_UPDATE_UNSUPPORTED			"batch_update_unsupported"
 #define WEB_DELETE_UNSUPPORTED			"batch_delete_unsupported"
+#define WEB_UNKNOWN_DICTIONARY			"unknown_dictionary"	/* machine mode: relation
+																 * not trusted (unprimed) */
 
 #define WALEXTRACT_MAX_REASONS	6
 #define WALEXTRACT_MAX_COLS		80
@@ -176,6 +180,22 @@ extern void walextract_context_reset(WalExtractContext *ctx);
 extern void walextract_set_emit(WalExtractContext *ctx, WalExtractEmit cb, void *sink);
 extern void walextract_set_emit_batch(WalExtractContext *ctx, WalExtractEmitBatch cb, void *sink);
 extern WalExtractActiveMode walextract_active_mode(const WalExtractContext *ctx);
+
+/*
+ * Range-start dictionary priming (v0).  A provider (e.g. the in-server SRF
+ * reading live catalogs) calls these BEFORE the WAL scan to seed the dictionary
+ * for relations created before the decoded range.  walextract_set_dict_primed()
+ * marks the dictionary trust state.  Priming is a startup cost, never per-row.
+ * Limitation: live-catalog priming is only valid when current catalog state
+ * corresponds to the requested range (same relfilenode / not rewritten/dropped).
+ */
+extern void walextract_prime_rel(WalExtractContext *ctx, Oid relfile, Oid relid,
+								 char relkind, const char *relname);
+extern void walextract_prime_attr(WalExtractContext *ctx, Oid relid, int16 attnum,
+								  Oid atttypid, int16 attlen, bool attbyval,
+								  char attalign, bool attisdropped, const char *attname);
+extern void walextract_set_dict_primed(WalExtractContext *ctx, bool primed);
+extern bool walextract_dict_primed(const WalExtractContext *ctx);
 extern Size walextract_buf_peak(const WalExtractContext *ctx);
 extern Size walextract_bbuf_peak(const WalExtractContext *ctx);
 extern void walextract_set_pgdata(WalExtractContext *ctx, const char *pgdata);

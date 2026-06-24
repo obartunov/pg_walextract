@@ -28,7 +28,7 @@ SELECT count(*) AS complete_wx_tr_inserts
 SELECT count(*) >= 1 AS post_boundary_row_not_stale_decoded
   FROM walextract_wal2sql(:'s',:'e')
  WHERE op = 'INSERT' AND relation IS NULL AND NOT complete
-   AND 'dictionary_missing' = ANY(reasons);
+   AND 'unknown_dictionary' = ANY(reasons);
 
 -- DROP: dropped relfilenode surfaces a boundary tagged with the old name.
 SELECT pg_current_wal_lsn() AS s2 \gset

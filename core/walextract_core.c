@@ -171,6 +171,7 @@ struct WalExtractContext
 	Size		buf_bytes_peak;		/* peak event-buffer bytes (commit-buffer memory) */
 	Size		bbuf_bytes_peak;	/* peak batch-buffer bytes */
 	const char *batch_unsupported_reason;	/* WEB_* set with WALEXTRACT_FATAL_UNSUPPORTED_BATCH */
+	bool		dict_primed;		/* dictionary seeded from a provider before the scan */
 };
 
 /* ===================== small helpers ===================== */
@@ -813,14 +814,32 @@ mine_relname_get(WalExtractContext *ctx, Oid relfile)
 }
 
 /*
- * Is this relfilenode a TOAST relation (pg_class.relkind == 't')?  Learned from
- * mined pg_class.  TOAST chunks are internal storage, not user DML: they must
- * never appear in the machine/event stream as user rows.  An unknown relfilenode
- * returns false, so the caller falls back to its normal user/system/catalog
- * handling (conservative: we only suppress relations we positively know are TOAST).
+ * Relation trust classification for a relfilenode, derived ONLY from the mined /
+ * primed dictionary (never a live catalog peek inside the core).  This is the
+ * machine-stream trust boundary: an unknown relfilenode must never be guessed to
+ * be user data.
+ *
+ *   WX_REL_CATALOG  - pg_class / pg_attribute: dictionary-learning, not a stream.
+ *   WX_REL_INTERNAL - known relkind that is not an ordinary table (TOAST 't',
+ *                     index, sequence, matview, ...) OR an untracked system
+ *                     relfilenode (< FirstNormalObjectId): internal storage.
+ *   WX_REL_USER     - known ordinary table (relkind 'r'): user DML stream.
+ *   WX_REL_UNKNOWN  - user-range relfilenode (>= FirstNormalObjectId) with no
+ *                     dictionary entry: untrusted, could be a pre-range table or
+ *                     a pre-range TOAST relation.  Machine mode fails closed;
+ *                     the forensic path marks it unknown_dictionary.
  */
-static bool
-mine_is_toast_rel(WalExtractContext *ctx, Oid relfile)
+typedef enum WalExtractRelTrust
+{
+	WX_REL_CATALOG,
+	WX_REL_INTERNAL,
+	WX_REL_USER,
+	WX_REL_UNKNOWN
+} WalExtractRelTrust;
+
+/* relkind for a relfilenode from the dictionary; 0 if unknown/invalidated */
+static char
+mine_relfile_relkind(WalExtractContext *ctx, Oid relfile)
 {
 	uint32		h = (relfile * 131u) % MINE_NREL;
 	int			i;
@@ -830,11 +849,28 @@ mine_is_toast_rel(WalExtractContext *ctx, Oid relfile)
 		MineRelMapEnt *e = &ctx->relfile[(h + i) % MINE_NREL];
 
 		if (!e->used)
-			return false;
+			return 0;
 		if (e->relfile == relfile)
-			return !e->invalid && e->relkind == RELKIND_TOASTVALUE;
+			return e->invalid ? 0 : e->relkind;
 	}
-	return false;
+	return 0;
+}
+
+static WalExtractRelTrust
+we_rel_trust(WalExtractContext *ctx, Oid relfile)
+{
+	char		rk;
+
+	if (mine_is_catalog(ctx, relfile))
+		return WX_REL_CATALOG;
+	if (relfile < FirstNormalObjectId)
+		return WX_REL_INTERNAL;		/* system storage range: never user data */
+	rk = mine_relfile_relkind(ctx, relfile);
+	if (rk == 0)
+		return WX_REL_UNKNOWN;		/* user-range relfilenode, not in dictionary */
+	if (rk == RELKIND_RELATION)
+		return WX_REL_USER;
+	return WX_REL_INTERNAL;			/* TOAST 't', index, sequence, matview, ... */
 }
 
 /*
@@ -938,27 +974,36 @@ mine_desc_invalidate(WalExtractContext *ctx, Oid relid)
 }
 
 static void
-mine_udesc_add(WalExtractContext *ctx, Form_pg_attribute f)
+mine_desc_add_col(WalExtractContext *ctx, Oid relid, int16 attnum, Oid atttypid,
+				  int16 attlen, bool attbyval, char attalign, bool attisdropped,
+				  const char *attname)
 {
-	MineRelDesc *d = mine_desc_get(ctx, f->attrelid, true);
+	MineRelDesc *d = mine_desc_get(ctx, relid, true);
 	int			i,
 				pos;
 
 	if (d == NULL || d->ncols >= (int) (sizeof(d->cols) / sizeof(d->cols[0])))
 		return;
 	for (i = 0; i < d->ncols; i++)
-		if (d->cols[i].attnum == f->attnum)
+		if (d->cols[i].attnum == attnum)
 			return;
-	for (pos = d->ncols; pos > 0 && d->cols[pos - 1].attnum > f->attnum; pos--)
+	for (pos = d->ncols; pos > 0 && d->cols[pos - 1].attnum > attnum; pos--)
 		d->cols[pos] = d->cols[pos - 1];
-	d->cols[pos].attnum = f->attnum;
-	d->cols[pos].atttypid = f->atttypid;
-	d->cols[pos].attlen = f->attlen;
-	d->cols[pos].attbyval = f->attbyval;
-	d->cols[pos].attalign = f->attalign;
-	d->cols[pos].attisdropped = f->attisdropped;
-	strlcpy(d->cols[pos].attname, NameStr(f->attname), sizeof(d->cols[pos].attname));
+	d->cols[pos].attnum = attnum;
+	d->cols[pos].atttypid = atttypid;
+	d->cols[pos].attlen = attlen;
+	d->cols[pos].attbyval = attbyval;
+	d->cols[pos].attalign = attalign;
+	d->cols[pos].attisdropped = attisdropped;
+	strlcpy(d->cols[pos].attname, attname ? attname : "", sizeof(d->cols[pos].attname));
 	d->ncols++;
+}
+
+static void
+mine_udesc_add(WalExtractContext *ctx, Form_pg_attribute f)
+{
+	mine_desc_add_col(ctx, f->attrelid, f->attnum, f->atttypid, f->attlen,
+					  f->attbyval, f->attalign, f->attisdropped, NameStr(f->attname));
 }
 
 /* ===================== value rendering (semantic honesty) ===================== */
@@ -1169,18 +1214,38 @@ mine_decode_dml(WalExtractContext *ctx, HeapTupleHeader htup, RelFileLocator *rl
 	char		op_text[8192];
 
 	/*
-	 * Focus the stream on user relations and relations we already track.
-	 * Untracked system catalogs (filenode < FirstNormalObjectId, no mapping)
-	 * are DDL side effects, surfaced via the pg_class/pg_attribute path, not
-	 * as user changes.  This keeps the physical stream usable for ProGate.
+	 * Trust gate.  The stream is focused on relations the dictionary positively
+	 * knows.  Internal/system relations (incl. TOAST) are dropped; an unknown
+	 * user-range relfilenode is NOT guessed to be a user table -- the forensic
+	 * path emits an explicit unknown_dictionary marker instead.
 	 */
-	relid = mine_relfile_get(ctx, relfile);
-	if (relfile < FirstNormalObjectId && relid == InvalidOid)
-		return;
-	if (mine_is_toast_rel(ctx, relfile))
-		return;					/* TOAST chunks are internal storage, not user rows */
-	if (relid == InvalidOid)
-		relid = relfile;		/* fresh table: relfilenode == oid */
+	{
+		WalExtractRelTrust trust = we_rel_trust(ctx, relfile);
+
+		if (trust == WX_REL_INTERNAL)
+			return;				/* system/TOAST/index/etc: not user rows */
+		if (trust == WX_REL_UNKNOWN)
+		{
+			memset(&ev, 0, sizeof(ev));
+			ev.record_lsn = ctx->cur_lsn;
+			ev.commit_lsn = InvalidXLogRecPtr;
+			ev.xid = ctx->cur_xid;
+			ev.db_oid = ctx->bound_db;
+			ev.rel_oid = relfile;
+			ev.relfilenode = relfile;
+			ev.relname = NULL;
+			ev.op = WCO_INSERT;
+			ev.ncols = 0;
+			ev.complete = false;
+			ev_add_reason(&ev, WER_UNKNOWN_DICTIONARY);
+			mine_format_insert(&ev, op_text, sizeof(op_text));
+			ev.op_text = op_text;
+			we_emit_event(ctx, &ev);
+			return;
+		}
+		/* WX_REL_USER (WX_REL_CATALOG never reaches mine_decode_dml) */
+		relid = mine_relfile_get(ctx, relfile);
+	}
 	relname = mine_relname_get(ctx, relfile);
 
 	memset(&ev, 0, sizeof(ev));
@@ -1917,24 +1982,6 @@ we_bbuf_free_all(WalExtractContext *ctx)
 }
 
 /*
- * Would this relfilenode's user DML be part of the machine output stream?
- * Mirrors mine_decode_dml()'s focus: catalogs are dictionary-learning (not user
- * stream), and an untracked system relfilenode is a DDL side effect.  Used so
- * the batch-mode fail-closed guards fire only for real user records.
- */
-static bool
-we_is_user_stream_rel(WalExtractContext *ctx, Oid relfile)
-{
-	if (mine_is_catalog(ctx, relfile))
-		return false;
-	if (mine_is_toast_rel(ctx, relfile))
-		return false;			/* TOAST relation is internal storage, not user DML */
-	if (relfile < FirstNormalObjectId && mine_relfile_get(ctx, relfile) == InvalidOid)
-		return false;
-	return true;
-}
-
-/*
  * Batch mode is a machine stream and must never silently drop a user record it
  * cannot represent.  Record a fatal status + stable reason; walextract_record()
  * stops processing on the next entry and the frontend surfaces it as an error.
@@ -1947,6 +1994,32 @@ we_batch_unsupported(WalExtractContext *ctx, const char *reason)
 		ctx->status = WALEXTRACT_FATAL_UNSUPPORTED_BATCH;
 		ctx->batch_unsupported_reason = reason;
 	}
+}
+
+/*
+ * Machine-mode trust gate for a user-DML heap record.  Returns true (and fails
+ * the stream closed) when the record must not flow into the machine stream:
+ *   UNKNOWN -> unknown_dictionary  (untrusted relfilenode: never guess "user")
+ *   USER    -> op_reason           (trusted user table, op not representable yet)
+ * INTERNAL/CATALOG return false: the caller continues (internal skipped, catalog
+ * learned).  This is the single place machine mode decides relfilenode trust.
+ */
+static bool
+we_batch_user_dml_blocked(WalExtractContext *ctx, Oid relfile, const char *op_reason)
+{
+	switch (we_rel_trust(ctx, relfile))
+	{
+		case WX_REL_UNKNOWN:
+			we_batch_unsupported(ctx, WEB_UNKNOWN_DICTIONARY);
+			return true;
+		case WX_REL_USER:
+			we_batch_unsupported(ctx, op_reason);
+			return true;
+		case WX_REL_INTERNAL:
+		case WX_REL_CATALOG:
+			return false;
+	}
+	return false;
 }
 
 /* ===================== record dispatch ===================== */
@@ -2066,11 +2139,9 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		 * (event sink is absent in batch mode), silently dropping a user row.
 		 * Single-INSERT coalescing is P3; until then, fail closed.
 		 */
-		if (ctx->batch_emit_cb && we_is_user_stream_rel(ctx, rloc.relNumber))
-		{
-			we_batch_unsupported(ctx, WEB_SINGLE_INSERT_UNSUPPORTED);
+		if (ctx->batch_emit_cb &&
+			we_batch_user_dml_blocked(ctx, rloc.relNumber, WEB_SINGLE_INSERT_UNSUPPORTED))
 			return;
-		}
 
 		if (blkdata == NULL)
 		{
@@ -2103,20 +2174,23 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		 * dictionary keeps learning.  Single-active mode: when a batch sink is
 		 * registered the event sink is absent, so no tee.
 		 */
-		if (ctx->batch_emit_cb && !mine_is_catalog(ctx, rloc.relNumber) &&
-			!mine_is_toast_rel(ctx, rloc.relNumber))
+		if (ctx->batch_emit_cb)
 		{
-			Oid			relfile = rloc.relNumber;
-			Oid			relid = mine_relfile_get(ctx, relfile);
+			WalExtractRelTrust trust = we_rel_trust(ctx, rloc.relNumber);
 
-			if (!(relfile < FirstNormalObjectId && relid == InvalidOid))
+			if (trust == WX_REL_UNKNOWN)
 			{
+				we_batch_unsupported(ctx, WEB_UNKNOWN_DICTIONARY);
+				return;
+			}
+			if (trust == WX_REL_USER)
+			{
+				Oid			relfile = rloc.relNumber;
+				Oid			relid = mine_relfile_get(ctx, relfile);
 				MineRelDesc *d;
 				WeBufBatch *bb;
 				int			row = 0;
 
-				if (relid == InvalidOid)
-					relid = relfile;
 				d = mine_desc_get(ctx, relid, false);
 
 				if (ptr == NULL)
@@ -2216,11 +2290,9 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		bool		catalog_trunc = false;
 
 		/* batch mode: user UPDATE is not representable as a ChangeBatch -> fail closed */
-		if (ctx->batch_emit_cb && we_is_user_stream_rel(ctx, rloc.relNumber))
-		{
-			we_batch_unsupported(ctx, WEB_UPDATE_UNSUPPORTED);
+		if (ctx->batch_emit_cb &&
+			we_batch_user_dml_blocked(ctx, rloc.relNumber, WEB_UPDATE_UNSUPPORTED))
 			return;
-		}
 
 		if (!mine_is_catalog(ctx, rloc.relNumber))
 			return;				/* user UPDATE not implemented (by design) */
@@ -2316,11 +2388,9 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		MineDictEnt *e;
 
 		/* batch mode: user DELETE is not representable as a ChangeBatch -> fail closed */
-		if (ctx->batch_emit_cb && we_is_user_stream_rel(ctx, rloc.relNumber))
-		{
-			we_batch_unsupported(ctx, WEB_DELETE_UNSUPPORTED);
+		if (ctx->batch_emit_cb &&
+			we_batch_user_dml_blocked(ctx, rloc.relNumber, WEB_DELETE_UNSUPPORTED))
 			return;
-		}
 
 		if (!mine_is_catalog(ctx, rloc.relNumber))
 			return;				/* user DELETE not implemented (by design) */
@@ -2427,6 +2497,34 @@ walextract_active_mode(const WalExtractContext *ctx)
 	if (ctx->emit_cb != NULL)
 		return WX_MODE_EVENT;
 	return WX_MODE_NONE;
+}
+
+void
+walextract_prime_rel(WalExtractContext *ctx, Oid relfile, Oid relid,
+					 char relkind, const char *relname)
+{
+	mine_relfile_put(ctx, relfile, relid, relkind, relname);
+}
+
+void
+walextract_prime_attr(WalExtractContext *ctx, Oid relid, int16 attnum, Oid atttypid,
+					  int16 attlen, bool attbyval, char attalign, bool attisdropped,
+					  const char *attname)
+{
+	mine_desc_add_col(ctx, relid, attnum, atttypid, attlen, attbyval, attalign,
+					  attisdropped, attname);
+}
+
+void
+walextract_set_dict_primed(WalExtractContext *ctx, bool primed)
+{
+	ctx->dict_primed = primed;
+}
+
+bool
+walextract_dict_primed(const WalExtractContext *ctx)
+{
+	return ctx->dict_primed;
 }
 
 Size

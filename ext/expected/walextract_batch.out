@@ -51,17 +51,14 @@ SELECT nrows, ncols, schema_missing, has_external_toast, null_cells,
 -- (dropped-column / descriptor-evolution coverage is deferred to P2A.1
 --  descriptor-shape hardening: the current P2A path decodes live columns at
 --  correct offsets (verified), so this is not a silent-loss/corruption case.)
--- case D: schema_missing (pre-range relation) -> ncols=0, rows counted, payload 0.
+-- case D: pre-range relation is UNKNOWN to the dictionary (unprimed) -> machine
+-- mode fails closed with unknown_dictionary (never guesses unknown as user data).
 SELECT pg_current_wal_lsn() AS d0 \gset
 COPY wxb_pre (a, b) FROM stdin;
 SELECT pg_current_wal_lsn() AS d1 \gset
 SELECT nrows, ncols, schema_missing, payload_bytes
   FROM walextract_wal2batch(:'d0', :'d1');
- nrows | ncols | schema_missing | payload_bytes 
--------+-------+----------------+---------------
-     2 |     0 | t              |             0
-(1 row)
-
+ERROR:  walextract batch mode stopped: unknown_dictionary
 -- case E: single user INSERT -> batch mode FAIL CLOSED while event mode is
 -- unchanged (decodes the same INSERT).  Proves the two modes are independent
 -- and that fail-closed is batch-mode-specific, not a loss of capability.
@@ -84,13 +81,13 @@ SELECT pg_current_wal_lsn() AS g0 \gset
 UPDATE wxb_fix SET c = c + 1 WHERE a = 1;
 SELECT pg_current_wal_lsn() AS g1 \gset
 SELECT n_batches FROM walextract_batch_stats(:'g0', :'g1');
-ERROR:  walextract batch mode stopped: batch_update_unsupported
+ERROR:  walextract batch mode stopped: unknown_dictionary
 -- case H: user DELETE in batch mode -> FAIL CLOSED.
 SELECT pg_current_wal_lsn() AS h0 \gset
 DELETE FROM wxb_fix WHERE a = 2;
 SELECT pg_current_wal_lsn() AS h1 \gset
 SELECT n_batches FROM walextract_batch_stats(:'h0', :'h1');
-ERROR:  walextract batch mode stopped: batch_delete_unsupported
+ERROR:  walextract batch mode stopped: unknown_dictionary
 -- case I: ABORT discards buffered batches.  Table is CREATEd+committed in range
 -- (typed batch), the COPY runs in an aborted txn; pg_switch_wal flushes so the
 -- COPY+ABORT are readable.  Aborted txn mutates no catalog -> discard, 0 batches.

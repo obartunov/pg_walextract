@@ -4,7 +4,7 @@
 CREATE EXTENSION walextract;
 
 -- pre-existing relation (created BEFORE any mined range): its descriptor is
--- never seen inside a range, so it must decode as dictionary_missing.
+-- never seen inside a range, so it must decode as unknown_dictionary.
 CREATE TABLE wx_pre (id int, v int);
 
 -- case 1: supported types -> complete=true, replayable op_text
@@ -35,13 +35,13 @@ SELECT op, relation, complete, reasons, op_text
   FROM walextract_wal2sql(:'s3', :'e3')
  WHERE op = 'INSERT' AND relation = 'wx_b';
 
--- case 4: unknown relation/descriptor -> complete=false, reason dictionary_missing
+-- case 4: relation unknown to the dictionary -> complete=false, reason unknown_dictionary
 SELECT pg_current_wal_lsn() AS s4 \gset
 INSERT INTO wx_pre VALUES (7, 8);
 SELECT pg_current_wal_lsn() AS e4 \gset
-SELECT op, complete, 'dictionary_missing' = ANY(reasons) AS dict_missing
+SELECT op, complete, 'unknown_dictionary' = ANY(reasons) AS unknown_dict
   FROM walextract_wal2sql(:'s4', :'e4')
- WHERE op = 'INSERT' AND complete IS FALSE AND 'dictionary_missing' = ANY(reasons);
+ WHERE op = 'INSERT' AND complete IS FALSE AND 'unknown_dictionary' = ANY(reasons);
 
 -- case 5: more columns than capacity -> complete=false, reason too_many_columns
 SELECT pg_current_wal_lsn() AS s5 \gset

@@ -3,7 +3,7 @@
 -- filtered out; exact-match assertions use op_text/reasons on user relations.
 CREATE EXTENSION walextract;
 -- pre-existing relation (created BEFORE any mined range): its descriptor is
--- never seen inside a range, so it must decode as dictionary_missing.
+-- never seen inside a range, so it must decode as unknown_dictionary.
 CREATE TABLE wx_pre (id int, v int);
 -- case 1: supported types -> complete=true, replayable op_text
 SELECT pg_current_wal_lsn() AS s1 \gset
@@ -46,14 +46,14 @@ SELECT op, relation, complete, reasons, op_text
  INSERT | wx_b     | f        | {toast_external,schema_missing} | -- INCOMPLETE INSERT rel="wx_b" reasons={toast_external,schema_missing}
 (1 row)
 
--- case 4: unknown relation/descriptor -> complete=false, reason dictionary_missing
+-- case 4: relation unknown to the dictionary -> complete=false, reason unknown_dictionary
 SELECT pg_current_wal_lsn() AS s4 \gset
 INSERT INTO wx_pre VALUES (7, 8);
 SELECT pg_current_wal_lsn() AS e4 \gset
-SELECT op, complete, 'dictionary_missing' = ANY(reasons) AS dict_missing
+SELECT op, complete, 'unknown_dictionary' = ANY(reasons) AS unknown_dict
   FROM walextract_wal2sql(:'s4', :'e4')
- WHERE op = 'INSERT' AND complete IS FALSE AND 'dictionary_missing' = ANY(reasons);
-   op   | complete | dict_missing 
+ WHERE op = 'INSERT' AND complete IS FALSE AND 'unknown_dictionary' = ANY(reasons);
+   op   | complete | unknown_dict 
 --------+----------+--------------
  INSERT | f        | t
 (1 row)

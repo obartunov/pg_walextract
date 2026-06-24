@@ -47,7 +47,8 @@ SELECT nrows, ncols, schema_missing, has_external_toast, null_cells,
 --  descriptor-shape hardening: the current P2A path decodes live columns at
 --  correct offsets (verified), so this is not a silent-loss/corruption case.)
 
--- case D: schema_missing (pre-range relation) -> ncols=0, rows counted, payload 0.
+-- case D: pre-range relation is UNKNOWN to the dictionary (unprimed) -> machine
+-- mode fails closed with unknown_dictionary (never guesses unknown as user data).
 SELECT pg_current_wal_lsn() AS d0 \gset
 COPY wxb_pre (a, b) FROM stdin;
 7	8
