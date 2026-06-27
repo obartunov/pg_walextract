@@ -1,0 +1,43 @@
+-- WX_SIDECAR 2 producer shape (deterministic; OIDs masked to booleans).
+-- Proves the v2 magic and the per-relation identity (I) record forms:
+--   a DEFAULT-identity table WITH a primary key -> "I <oid> d <natts>=1"
+--   a DEFAULT-identity table WITHOUT a primary key -> "I <oid> d 0"
+--   a REPLICA IDENTITY FULL table -> "I <oid> f 0"
+--   a REPLICA IDENTITY NOTHING table -> "I <oid> n 0"
+-- The DML identity gate reasons (identity_metadata_missing / identity_key_missing
+-- / dml_emit_pending) require explicit OLD_KEY/OLD_TUPLE records, which only
+-- appear at wal_level=logical, so they live in the runtime (@Teodor) probe.
+CREATE EXTENSION walextract;
+CREATE TABLE dml_haspk(id int primary key, v int);
+CREATE TABLE dml_nopk(a int, b int);
+CREATE TABLE dml_full(id int primary key, v int);
+ALTER TABLE dml_full REPLICA IDENTITY FULL;
+CREATE TABLE dml_nothing(id int primary key, v int);
+ALTER TABLE dml_nothing REPLICA IDENTITY NOTHING;
+SELECT
+    (e ~ '(^|\n)WX_SIDECAR 2\n')        AS v2_magic,
+    (e ~ '\nI [0-9]+ d [1-9]')          AS some_d_table_has_key,
+    (e ~ '\nI [0-9]+ d 0(\n|$)')        AS some_d_table_no_key,
+    (e ~ '\nI [0-9]+ f 0(\n|$)')        AS full_identity_record,
+    (e ~ '\nI [0-9]+ n 0(\n|$)')        AS nothing_identity_record
+FROM (SELECT walextract_export_dictionary() AS e) q;
+ v2_magic | some_d_table_has_key | some_d_table_no_key | full_identity_record | nothing_identity_record 
+----------+----------------------+---------------------+----------------------+-------------------------
+ t        | t                    | t                   | t                    | t
+(1 row)
+
+-- The I record for our PK table carries exactly its PK attnum (id = attnum 1).
+SELECT EXISTS (
+    SELECT 1
+    FROM regexp_split_to_table(
+             (SELECT walextract_export_dictionary()), '\n') AS line
+    WHERE line = 'I ' || (SELECT relfilenode::text FROM pg_class WHERE relname = 'dml_haspk')
+                      || ' d 1 1'
+) AS haspk_I_record_is_d_1_1;
+ haspk_i_record_is_d_1_1 
+-------------------------
+ t
+(1 row)
+
+DROP TABLE dml_haspk, dml_nopk, dml_full, dml_nothing;
+DROP EXTENSION walextract;
