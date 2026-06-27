@@ -328,13 +328,166 @@ walextract_export_dictionary(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(cstring_to_text_with_len(buf.data, buf.len));
 }
 
+/*
+ * Consume a WX_SIDECAR v0 text blob: validate provenance, then prime the
+ * dictionary.  Machine-mode policy: any validation failure is fail-closed
+ * (ereport ERROR) -- a rejected sidecar must never silently fall through to an
+ * unprimed (and thus partly UNKNOWN) decode.
+ *
+ * Validation: magic+version; system_identifier == this cluster; source_db_oid ==
+ * MyDatabaseId; snapshot_lsn <= start_lsn (the sidecar may only seed a range
+ * that begins at/after the captured catalog state -- capture-then-decode-later).
+ */
+static void
+prime_from_sidecar(WalExtractContext *ctx, text *sidecar, XLogRecPtr start_lsn)
+{
+	char	   *raw = text_to_cstring(sidecar);
+	char	   *saveptr = NULL;
+	char	   *line;
+	bool		have_magic = false;
+	bool		have_sysid = false;
+	bool		have_db = false;
+	bool		have_lsn = false;
+	bool		header_done = false;
+
+	for (line = strtok_r(raw, "\n", &saveptr);
+		 line != NULL;
+		 line = strtok_r(NULL, "\n", &saveptr))
+	{
+		while (*line == ' ' || *line == '\t' || *line == '\r')
+			line++;
+		if (*line == '\0')
+			continue;
+
+		if (line[0] == 'R' && line[1] == ' ')
+		{
+			Oid			relfile;
+			Oid			relid;
+			char		relkind = 0;
+			int			off = 0;
+
+			if (!header_done)
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: record before complete header")));
+			if (sscanf(line, "R %u %u %c %n", &relfile, &relid, &relkind, &off) < 3 || off == 0)
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: malformed R record")));
+			walextract_prime_rel(ctx, relfile, relid, relkind, line + off);
+			continue;
+		}
+		if (line[0] == 'A' && line[1] == ' ')
+		{
+			Oid			relid;
+			Oid			atttypid;
+			int			attnum;
+			int			attlen;
+			int			abv;
+			int			aisd;
+			char		attalign = 0;
+			int			off = 0;
+
+			if (!header_done)
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: record before complete header")));
+			if (sscanf(line, "A %u %d %u %d %d %c %d %n",
+					   &relid, &attnum, &atttypid, &attlen, &abv, &attalign, &aisd, &off) < 7 || off == 0)
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: malformed A record")));
+			walextract_prime_attr(ctx, relid, (int16) attnum, atttypid, (int16) attlen,
+								  abv ? true : false, attalign, aisd ? true : false, line + off);
+			continue;
+		}
+
+		if (!have_magic)
+		{
+			int			ver = 0;
+
+			if (sscanf(line, "WX_SIDECAR %d", &ver) != 1)
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: bad magic (expected WX_SIDECAR)")));
+			if (ver != 1)
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: unsupported version %d", ver)));
+			have_magic = true;
+			continue;
+		}
+		if (strncmp(line, "system_identifier ", 18) == 0)
+		{
+			uint64		sysid = 0;
+
+			if (sscanf(line + 18, UINT64_FORMAT, &sysid) != 1)
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: bad system_identifier")));
+			if (sysid != GetSystemIdentifier())
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: system_identifier mismatch")));
+			have_sysid = true;
+			continue;
+		}
+		if (strncmp(line, "source_db_oid ", 14) == 0)
+		{
+			Oid			db = InvalidOid;
+
+			if (sscanf(line + 14, "%u", &db) != 1)
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: bad source_db_oid")));
+			if (db != MyDatabaseId)
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: source_db_oid mismatch (sidecar %u, current %u)",
+									   db, MyDatabaseId)));
+			have_db = true;
+			continue;
+		}
+		if (strncmp(line, "snapshot_lsn ", 13) == 0)
+		{
+			uint32		hi = 0;
+			uint32		lo = 0;
+			XLogRecPtr	snap;
+
+			if (sscanf(line + 13, "%X/%X", &hi, &lo) != 2)
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: bad snapshot_lsn")));
+			snap = ((uint64) hi << 32) | lo;
+			if (snap > start_lsn)
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: snapshot_lsn %X/%X is after range start %X/%X",
+									   LSN_FORMAT_ARGS(snap), LSN_FORMAT_ARGS(start_lsn))));
+			have_lsn = true;
+			continue;
+		}
+		if (strncmp(line, "counts ", 7) == 0)
+		{
+			if (!(have_magic && have_sysid && have_db && have_lsn))
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: incomplete header before counts")));
+			header_done = true;
+			continue;
+		}
+		/* extracted_at / source / unknown header lines: informational, ignored */
+	}
+
+	if (!header_done)
+		ereport(ERROR, (errmsg("walextract: sidecar rejected: missing or incomplete header")));
+
+	walextract_set_dict_primed(ctx, true);
+	pfree(raw);
+}
+
+/* arg slot 3: empty text means "no sidecar" (lets the SRFs stay STRICT). */
+static text *
+sidecar_arg_or_null(text *t)
+{
+	return (VARSIZE_ANY_EXHDR(t) == 0) ? NULL : t;
+}
+
+/*
+ * Apply the chosen priming source to a fresh context.  A non-NULL sidecar takes
+ * precedence over the live-catalog prime flag (the caller asked to decode a
+ * historical range against a captured snapshot, not the live catalog).
+ */
+static void
+apply_priming(WalExtractContext *ctx, bool prime, text *sidecar, XLogRecPtr start_lsn)
+{
+	if (sidecar != NULL)
+		prime_from_sidecar(ctx, sidecar, start_lsn);
+	else if (prime)
+		prime_from_catalog(ctx);
+}
+
 /* shared WAL scan in batch mode; ERRORs (fail-closed) if the core stops */
 static XLogReaderState *InitXLogReaderState(XLogRecPtr lsn);	/* defined below */
 static XLogRecord *ReadNextXLogRecord(XLogReaderState *xlogreader);	/* defined below */
 
 static void
 scan_batches(XLogRecPtr start_lsn, XLogRecPtr end_lsn, BatchSinkCtx *bs,
-			 bool prime, int64 *ev_peak, int64 *b_peak)
+			 bool prime, text *sidecar, int64 *ev_peak, int64 *b_peak)
 {
 	XLogReaderState *xlogreader;
 	WalExtractContext *wectx;
@@ -362,8 +515,7 @@ scan_batches(XLogRecPtr start_lsn, XLogRecPtr end_lsn, BatchSinkCtx *bs,
 	walextract_set_pgdata(wectx, DataDir);
 	walextract_set_bootstrap(wectx, false);
 	walextract_set_target_db(wectx, MyDatabaseId);
-	if (prime)
-		prime_from_catalog(wectx);
+	apply_priming(wectx, prime, sidecar, start_lsn);
 
 	xlogreader = InitXLogReaderState(start_lsn);
 	while (ReadNextXLogRecord(xlogreader) && xlogreader->EndRecPtr <= end_lsn)
@@ -503,8 +655,8 @@ walextract_wal2sql(PG_FUNCTION_ARGS)
 	walextract_set_pgdata(wectx, DataDir);
 	walextract_set_bootstrap(wectx, false);
 	walextract_set_target_db(wectx, MyDatabaseId);
-	if (PG_GETARG_BOOL(2))
-		prime_from_catalog(wectx);
+	apply_priming(wectx, PG_GETARG_BOOL(2),
+				  sidecar_arg_or_null(PG_GETARG_TEXT_PP(3)), start_lsn);
 
 	xlogreader = InitXLogReaderState(start_lsn);
 	while (ReadNextXLogRecord(xlogreader) &&
@@ -593,8 +745,8 @@ walextract_wal2event_count(PG_FUNCTION_ARGS)
 	walextract_set_pgdata(wectx, DataDir);
 	walextract_set_bootstrap(wectx, false);
 	walextract_set_target_db(wectx, MyDatabaseId);
-	if (PG_GETARG_BOOL(2))
-		prime_from_catalog(wectx);
+	apply_priming(wectx, PG_GETARG_BOOL(2),
+				  sidecar_arg_or_null(PG_GETARG_TEXT_PP(3)), start_lsn);
 
 	xlogreader = InitXLogReaderState(start_lsn);
 	while (ReadNextXLogRecord(xlogreader) && xlogreader->EndRecPtr <= end_lsn)
@@ -642,7 +794,9 @@ walextract_wal2batch(PG_FUNCTION_ARGS)
 	bs.tupstore = rsinfo->setResult;
 	bs.tupdesc = rsinfo->setDesc;
 	bs.detail = true;
-	scan_batches(start_lsn, end_lsn, &bs, PG_GETARG_BOOL(2), &ev_peak, &b_peak);
+	scan_batches(start_lsn, end_lsn, &bs, PG_GETARG_BOOL(2),
+				 sidecar_arg_or_null(PG_GETARG_TEXT_PP(3)),
+				 &ev_peak, &b_peak);
 	return (Datum) 0;
 }
 
@@ -662,7 +816,9 @@ walextract_batch_stats(PG_FUNCTION_ARGS)
 	InitMaterializedSRF(fcinfo, 0);
 	memset(&bs, 0, sizeof(bs));
 	bs.detail = false;
-	scan_batches(start_lsn, end_lsn, &bs, PG_GETARG_BOOL(2), &ev_peak, &b_peak);
+	scan_batches(start_lsn, end_lsn, &bs, PG_GETARG_BOOL(2),
+				 sidecar_arg_or_null(PG_GETARG_TEXT_PP(3)),
+				 &ev_peak, &b_peak);
 
 	memset(isnull, 0, sizeof(isnull));
 	values[0] = Int64GetDatum(bs.n_batches);
