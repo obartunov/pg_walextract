@@ -58,6 +58,11 @@ typedef enum WalChangeOp
 #define WEB_DML_EMIT_PENDING			"dml_emit_pending"	/* explicit identity present;
 															 * ChangeDmlBatch emission is the
 															 * next increment (temp dev guard) */
+#define WEB_IDENTITY_METADATA_MISSING	"identity_metadata_missing"	/* no v2 I record
+												 * for this relfile */
+#define WEB_IDENTITY_KEY_MISSING		"identity_key_missing"	/* metadata says no usable
+												 * identity key (e.g. DEFAULT
+												 * with no primary key) */
 
 #define WALEXTRACT_MAX_REASONS	6
 #define WALEXTRACT_MAX_COLS		80
@@ -208,6 +213,9 @@ extern void walextract_prime_rel(WalExtractContext *ctx, Oid relfile, Oid relid,
 extern void walextract_prime_attr(WalExtractContext *ctx, Oid relid, int16 attnum,
 								  Oid atttypid, int16 attlen, bool attbyval,
 								  char attalign, bool attisdropped, const char *attname);
+#define WX_IDENT_MAXATTS 32		/* == INDEX_MAX_KEYS */
+extern void walextract_prime_identity(WalExtractContext *ctx, Oid relfile,
+									  char relreplident, const int16 *atts, int natts);
 extern void walextract_set_dict_primed(WalExtractContext *ctx, bool primed);
 extern bool walextract_dict_primed(const WalExtractContext *ctx);
 extern Size walextract_buf_peak(const WalExtractContext *ctx);

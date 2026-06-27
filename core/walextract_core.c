@@ -89,6 +89,22 @@ typedef struct MineRelDesc
 } MineRelDesc;
 #define MINE_NDESC 1024
 
+/* ---- per-relation DML identity metadata (WX_SIDECAR 2), keyed by relfile ----
+ * Populated only from a v2 sidecar I record or the live-prime identity resolver;
+ * an in-range-learned relation has no entry, so its explicit-identity UPDATE/
+ * DELETE fails closed identity_metadata_missing.  natts is the resolved
+ * identity-key column count (0 for FULL/NOTHING and for DEFAULT with no PK).
+ */
+typedef struct MineIdentEnt
+{
+	bool		used;
+	Oid			relfile;
+	char		relreplident;	/* 'd' 'i' 'f' 'n' */
+	int16		natts;
+	int16		atts[WX_IDENT_MAXATTS];
+} MineIdentEnt;
+#define MINE_NIDENT 4096
+
 /*
  * ---- transaction assembler: per-xid buffered physical ChangeEvents ----
  *
@@ -152,6 +168,7 @@ struct WalExtractContext
 	MineDictEnt dict[MINE_DICT_SZ];
 	MineRelMapEnt relfile[MINE_NREL];
 	MineRelDesc desc[MINE_NDESC];
+	MineIdentEnt ident[MINE_NIDENT];	/* per-relation DML identity (WX_SIDECAR 2) */
 
 	/* transaction assembler: WAL-order list of buffered, not-yet-committed events */
 	WeBufEvent *buf_head;
@@ -2398,36 +2415,134 @@ we_batch_user_dml_blocked(WalExtractContext *ctx, Oid relfile, const char *op_re
 }
 
 /*
- * Explicit-evidence identity classifier for a user UPDATE record.  The machine
- * path may only treat a row as identity-safe when the WAL record itself carries
- * old identity (CONTAINS_OLD_TUPLE for REPLICA IDENTITY FULL, CONTAINS_OLD_KEY
- * for DEFAULT/INDEX with the key explicitly logged).  Anything else fails closed:
- *   - HOT update: deferred in v0 (hot_update_unsupported);
- *   - no CONTAINS_OLD_*: no_explicit_old_identity -- the central safety rule;
- *     never infer identity from the new tuple, since at wal_level=replica the
- *     record is byte-indistinguishable from a logical key-unchanged update and
- *     the old identity was simply not logged.
- * When old identity IS explicitly present the row is identity-eligible; emission
- * via ChangeDmlBatch is the next increment, so v0 returns the dml_emit_pending
- * dev guard rather than silently dropping or guessing.
+ * Per-relation DML identity metadata store (WX_SIDECAR 2 / live-prime).  Same
+ * open-addressing scheme as the relfile map.  walextract_prime_identity is the
+ * single sink used by BOTH the sidecar consumer and the live-prime resolver, so
+ * the two priming paths produce identical identity decisions.
+ */
+void
+walextract_prime_identity(WalExtractContext *ctx, Oid relfile, char relreplident,
+						  const int16 *atts, int natts)
+{
+	uint32		h;
+	int			i;
+
+	if (relfile == InvalidOid)
+		return;
+	if (natts < 0)
+		natts = 0;
+	if (natts > WX_IDENT_MAXATTS)
+		natts = WX_IDENT_MAXATTS;	/* INDEX_MAX_KEYS bound; never exceeded */
+	h = (relfile * 131u) % MINE_NIDENT;
+	for (i = 0; i < MINE_NIDENT; i++)
+	{
+		MineIdentEnt *e = &ctx->ident[(h + i) % MINE_NIDENT];
+
+		if (!e->used || e->relfile == relfile)
+		{
+			int			k;
+
+			e->used = true;
+			e->relfile = relfile;
+			e->relreplident = relreplident;
+			e->natts = (int16) natts;
+			for (k = 0; k < natts; k++)
+				e->atts[k] = atts[k];
+			return;
+		}
+	}
+}
+
+static const MineIdentEnt *
+mine_ident_find(WalExtractContext *ctx, Oid relfile)
+{
+	uint32		h = (relfile * 131u) % MINE_NIDENT;
+	int			i;
+
+	for (i = 0; i < MINE_NIDENT; i++)
+	{
+		const MineIdentEnt *e = &ctx->ident[(h + i) % MINE_NIDENT];
+
+		if (!e->used)
+			return NULL;
+		if (e->relfile == relfile)
+			return e;
+	}
+	return NULL;
+}
+
+/*
+ * Per-relation DML identity gate, reached only when the WAL record carried
+ * explicit old identity (CONTAINS_OLD_TUPLE/_OLD_KEY).  key_required is true for
+ * an OLD_KEY (key-based) record and false for an OLD_TUPLE (full) record.
+ *   no v2 I record for this relfile      -> identity_metadata_missing
+ *   key required but metadata has no key -> identity_key_missing
+ *   otherwise                            -> dml_emit_pending (emission is 2c)
+ * No global "sidecar has identity" shortcut: the decision is strictly per
+ * relation, so a v2 sidecar missing this relation's I record still fails closed.
  */
 static const char *
-we_classify_update(uint8 flags, uint8 op)
+we_identity_gate(WalExtractContext *ctx, Oid relfile, bool key_required)
+{
+	const MineIdentEnt *e = mine_ident_find(ctx, relfile);
+
+	if (e == NULL)
+		return WEB_IDENTITY_METADATA_MISSING;
+	if (key_required && e->natts == 0)
+		return WEB_IDENTITY_KEY_MISSING;
+	return WEB_DML_EMIT_PENDING;
+}
+
+/*
+ * Reason for a record that carried NO explicit old identity.  If primed metadata
+ * PROVES the relation has no usable identity (REPLICA IDENTITY NOTHING, or
+ * DEFAULT with no primary key), surface that as the metadata reason
+ * identity_key_missing -- it outranks a bare WAL-flag absence.  Otherwise the
+ * relation may well have identity that this record simply did not carry (e.g. a
+ * DEFAULT key-unchanged update): that is the corruption-prevention case and
+ * stays no_explicit_old_identity.
+ */
+static const char *
+we_no_flag_reason(WalExtractContext *ctx, Oid relfile)
+{
+	const MineIdentEnt *e = mine_ident_find(ctx, relfile);
+
+	if (e != NULL &&
+		(e->relreplident == 'n' || (e->relreplident == 'd' && e->natts == 0)))
+		return WEB_IDENTITY_KEY_MISSING;
+	return WEB_NO_EXPLICIT_OLD_IDENTITY;
+}
+
+/*
+ * Explicit-evidence identity classifier for a user UPDATE record.  HOT defers in
+ * v0.  A record with no CONTAINS_OLD_* carries no identity and must fail closed
+ * no_explicit_old_identity -- never infer identity from the new tuple (at
+ * wal_level=replica that record is byte-indistinguishable from a logical
+ * key-unchanged update).  With explicit old identity the per-relation gate
+ * decides; OLD_TUPLE is full-tuple identity (no key required), OLD_KEY is
+ * key-based.
+ */
+static const char *
+we_classify_update(WalExtractContext *ctx, Oid relfile, uint8 flags, uint8 op)
 {
 	if (op == XLOG_HEAP_HOT_UPDATE)
 		return WEB_HOT_UPDATE_UNSUPPORTED;
-	if (flags & (XLH_UPDATE_CONTAINS_OLD_TUPLE | XLH_UPDATE_CONTAINS_OLD_KEY))
-		return WEB_DML_EMIT_PENDING;
-	return WEB_NO_EXPLICIT_OLD_IDENTITY;
+	if (flags & XLH_UPDATE_CONTAINS_OLD_TUPLE)
+		return we_identity_gate(ctx, relfile, false);
+	if (flags & XLH_UPDATE_CONTAINS_OLD_KEY)
+		return we_identity_gate(ctx, relfile, true);
+	return we_no_flag_reason(ctx, relfile);
 }
 
 /* Explicit-evidence identity classifier for a user DELETE record. */
 static const char *
-we_classify_delete(uint8 flags)
+we_classify_delete(WalExtractContext *ctx, Oid relfile, uint8 flags)
 {
-	if (flags & (XLH_DELETE_CONTAINS_OLD_TUPLE | XLH_DELETE_CONTAINS_OLD_KEY))
-		return WEB_DML_EMIT_PENDING;
-	return WEB_NO_EXPLICIT_OLD_IDENTITY;
+	if (flags & XLH_DELETE_CONTAINS_OLD_TUPLE)
+		return we_identity_gate(ctx, relfile, false);
+	if (flags & XLH_DELETE_CONTAINS_OLD_KEY)
+		return we_identity_gate(ctx, relfile, true);
+	return we_no_flag_reason(ctx, relfile);
 }
 
 /* ===================== record dispatch ===================== */
@@ -2752,7 +2867,7 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		/* batch mode: user UPDATE is not representable as a ChangeBatch -> fail closed */
 		if (ctx->batch_emit_cb &&
 			we_batch_user_dml_blocked(ctx, rloc.relNumber,
-									 we_classify_update(xlrec->flags, op)))
+									 we_classify_update(ctx, rloc.relNumber, xlrec->flags, op)))
 			return;
 
 		if (!mine_is_catalog(ctx, rloc.relNumber))
@@ -2868,7 +2983,7 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		/* batch mode: user DELETE is not representable as a ChangeBatch -> fail closed */
 		if (ctx->batch_emit_cb &&
 			we_batch_user_dml_blocked(ctx, rloc.relNumber,
-									 we_classify_delete(xlrec->flags)))
+									 we_classify_delete(ctx, rloc.relNumber, xlrec->flags)))
 			return;
 
 		if (!mine_is_catalog(ctx, rloc.relNumber))

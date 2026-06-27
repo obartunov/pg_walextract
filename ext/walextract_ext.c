@@ -171,6 +171,81 @@ batch_sink(const ChangeBatch *b, void *sink)
  * state corresponds to the requested range (same relfilenode, not rewritten /
  * dropped).  Startup cost only -- never per-row.
  */
+/*
+ * Shared identity resolver for WX_SIDECAR 2.  Runs one SPI query that resolves,
+ * per ordinary table, the replica-identity descriptor and the resolved
+ * identity-key attnums, and feeds EXACTLY ONE sink:
+ *   out != NULL  -> append "I <relfile> <relreplident> <natts> <att..>" lines
+ *                   (sidecar producer);
+ *   ctx != NULL  -> walextract_prime_identity() (live-prime).
+ * Using one query for both paths is what makes live-prime and a v2 sidecar
+ * classify identically for the same catalog state.  Caller holds an open SPI
+ * connection.  relreplident resolution: 'd' -> primary-key columns (none if no
+ * valid PK), 'i' -> replica-identity index columns, 'f'/'n' -> none.
+ */
+static void
+walextract_collect_identity(StringInfo out, WalExtractContext *ctx)
+{
+	const char *q =
+		"SELECT c.relfilenode, c.relreplident, "
+		"COALESCE(( "
+		"  SELECT string_agg(u.k::text, ' ' ORDER BY u.ord) "
+		"  FROM pg_catalog.pg_index x "
+		"  CROSS JOIN LATERAL unnest(x.indkey::int2[]) WITH ORDINALITY AS u(k, ord) "
+		"  WHERE x.indrelid = c.oid AND x.indisvalid AND x.indisready AND u.k > 0 "
+		"    AND ((c.relreplident = 'd' AND x.indisprimary) "
+		"         OR (c.relreplident = 'i' AND x.indisreplident)) "
+		"), '') AS atts "
+		"FROM pg_catalog.pg_class c "
+		"WHERE c.relkind = 'r' AND c.relfilenode <> 0";
+	uint64		i;
+
+	if (SPI_execute(q, true, 0) != SPI_OK_SELECT)
+		return;
+
+	for (i = 0; i < SPI_processed; i++)
+	{
+		TupleDesc	td = SPI_tuptable->tupdesc;
+		HeapTuple	t = SPI_tuptable->vals[i];
+		bool		isnull;
+		Oid			relfile = DatumGetObjectId(SPI_getbinval(t, td, 1, &isnull));
+		char		relreplident = DatumGetChar(SPI_getbinval(t, td, 2, &isnull));
+		char	   *atts_str = SPI_getvalue(t, td, 3);
+		int16		atts[WX_IDENT_MAXATTS];
+		int			natts = 0;
+		char	   *p = atts_str;
+
+		while (p != NULL && natts < WX_IDENT_MAXATTS)
+		{
+			int			v;
+			int			n2 = 0;
+
+			while (*p == ' ')
+				p++;
+			if (*p == '\0')
+				break;
+			if (sscanf(p, "%d%n", &v, &n2) != 1 || n2 == 0)
+				break;
+			atts[natts++] = (int16) v;
+			p += n2;
+		}
+
+		if (out != NULL)
+		{
+			int			k;
+
+			appendStringInfo(out, "I %u %c %d", relfile, relreplident, natts);
+			for (k = 0; k < natts; k++)
+				appendStringInfo(out, " %d", atts[k]);
+			appendStringInfoChar(out, '\n');
+		}
+		if (ctx != NULL)
+			walextract_prime_identity(ctx, relfile, relreplident, atts, natts);
+		if (atts_str)
+			pfree(atts_str);
+	}
+}
+
 static void
 prime_from_catalog(WalExtractContext *ctx)
 {
@@ -225,6 +300,7 @@ prime_from_catalog(WalExtractContext *ctx)
 		}
 	}
 
+	walextract_collect_identity(NULL, ctx);
 	SPI_finish();
 	walextract_set_dict_primed(ctx, true);
 }
@@ -245,6 +321,7 @@ walextract_export_dictionary(PG_FUNCTION_ARGS)
 	StringInfoData buf;
 	StringInfoData rels;
 	StringInfoData attrs;
+	StringInfoData idents;
 	uint64		nrels = 0;
 	uint64		nattrs = 0;
 	uint64		i;
@@ -252,6 +329,7 @@ walextract_export_dictionary(PG_FUNCTION_ARGS)
 	initStringInfo(&buf);
 	initStringInfo(&rels);
 	initStringInfo(&attrs);
+	initStringInfo(&idents);
 
 	if (SPI_connect() != SPI_OK_CONNECT)
 		ereport(ERROR, (errmsg("walextract: SPI_connect failed in export")));
@@ -309,9 +387,10 @@ walextract_export_dictionary(PG_FUNCTION_ARGS)
 		}
 	}
 
+	walextract_collect_identity(&idents, NULL);
 	SPI_finish();
 
-	appendStringInfoString(&buf, "WX_SIDECAR 1\n");
+	appendStringInfoString(&buf, "WX_SIDECAR 2\n");
 	appendStringInfo(&buf, "system_identifier " UINT64_FORMAT "\n",
 					 GetSystemIdentifier());
 	appendStringInfo(&buf, "source_db_oid %u\n", MyDatabaseId);
@@ -324,6 +403,7 @@ walextract_export_dictionary(PG_FUNCTION_ARGS)
 					 nrels, nattrs);
 	appendBinaryStringInfo(&buf, rels.data, rels.len);
 	appendBinaryStringInfo(&buf, attrs.data, attrs.len);
+	appendBinaryStringInfo(&buf, idents.data, idents.len);
 
 	PG_RETURN_TEXT_P(cstring_to_text_with_len(buf.data, buf.len));
 }
@@ -394,13 +474,49 @@ prime_from_sidecar(WalExtractContext *ctx, text *sidecar, XLogRecPtr start_lsn)
 			continue;
 		}
 
+		if (line[0] == 'I' && line[1] == ' ')
+		{
+			Oid			relfile;
+			char		relreplident = 0;
+			int			natts = 0;
+			int			off = 0;
+			int16		atts[WX_IDENT_MAXATTS];
+			int			got = 0;
+			char	   *p;
+
+			if (!header_done)
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: record before complete header")));
+			if (sscanf(line, "I %u %c %d %n", &relfile, &relreplident, &natts, &off) < 3 || off == 0)
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: malformed I record")));
+			if (natts < 0 || natts > WX_IDENT_MAXATTS)
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: I record natts %d out of range", natts)));
+			p = line + off;
+			for (got = 0; got < natts; got++)
+			{
+				int			v;
+				int			n2 = 0;
+
+				while (*p == ' ')
+					p++;
+				if (sscanf(p, "%d%n", &v, &n2) != 1 || n2 == 0)
+					break;
+				atts[got] = (int16) v;
+				p += n2;
+			}
+			if (got != natts)
+				ereport(ERROR, (errmsg("walextract: sidecar rejected: I record attnum count mismatch (want %d, got %d)",
+									   natts, got)));
+			walextract_prime_identity(ctx, relfile, relreplident, atts, natts);
+			continue;
+		}
+
 		if (!have_magic)
 		{
 			int			ver = 0;
 
 			if (sscanf(line, "WX_SIDECAR %d", &ver) != 1)
 				ereport(ERROR, (errmsg("walextract: sidecar rejected: bad magic (expected WX_SIDECAR)")));
-			if (ver != 1)
+			if (ver != 1 && ver != 2)
 				ereport(ERROR, (errmsg("walextract: sidecar rejected: unsupported version %d", ver)));
 			have_magic = true;
 			continue;

@@ -65,7 +65,7 @@ SELECT 'case5 wrong-db        ' AS label,
 SELECT 'case6 snapshot-after  ' AS label,
        try_decode(:'s1', :'e1', (SELECT regexp_replace(s,'snapshot_lsn [0-9A-F]+/[0-9A-F]+','snapshot_lsn FFFFFFFF/FFFFFFFF') FROM _sc)) AS result;
 SELECT 'case7 corrupted-magic ' AS label,
-       try_decode(:'s1', :'e1', (SELECT regexp_replace(s,'WX_SIDECAR 1','GARBAGE') FROM _sc)) AS result;
+       try_decode(:'s1', :'e1', (SELECT regexp_replace(s,'WX_SIDECAR [0-9]+','GARBAGE') FROM _sc)) AS result;
 
 -- ============================ case 8 ============================
 -- sidecar-primed + in-range DROP COLUMN -> descriptor invalidated, post-drop

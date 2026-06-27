@@ -94,7 +94,7 @@ SELECT 'case6 snapshot-after  ' AS label,
 (1 row)
 
 SELECT 'case7 corrupted-magic ' AS label,
-       try_decode(:'s1', :'e1', (SELECT regexp_replace(s,'WX_SIDECAR 1','GARBAGE') FROM _sc)) AS result;
+       try_decode(:'s1', :'e1', (SELECT regexp_replace(s,'WX_SIDECAR [0-9]+','GARBAGE') FROM _sc)) AS result;
          label          |       result       
 ------------------------+--------------------
  case7 corrupted-magic  | rejected bad_magic
