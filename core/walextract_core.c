@@ -170,6 +170,8 @@ struct WalExtractContext
 	Size		bbuf_bytes;
 	Size		buf_bytes_peak;		/* peak event-buffer bytes (commit-buffer memory) */
 	Size		bbuf_bytes_peak;	/* peak batch-buffer bytes */
+	struct WeInsertAccum *iacc_head;	/* open single-INSERT accumulators (by xid,relfile) */
+	struct WeInsertAccum *iacc_tail;
 	const char *batch_unsupported_reason;	/* WEB_* set with WALEXTRACT_FATAL_UNSUPPORTED_BATCH */
 	bool		dict_primed;		/* dictionary seeded from a provider before the scan */
 };
@@ -2086,6 +2088,274 @@ we_bbuf_free_all(WalExtractContext *ctx)
 	ctx->bbuf_bytes = 0;
 }
 
+static void we_batch_unsupported(WalExtractContext *ctx, const char *reason);
+
+/* ============ single-INSERT accumulator (one ChangeBatch per xid+relfile) ============
+ *
+ * HEAP2 MULTI_INSERT already arrives as N tuples in one record and becomes one
+ * ChangeBatch.  Single HEAP_INSERT records carry one tuple each; turning each
+ * into its own batch would be a per-row malloc and would buffer 100k tiny
+ * batches.  Instead we accumulate the reconstructed raw tuple images per
+ * (xid, relfilenode) in a doubling byte arena, and at COMMIT materialize ONE
+ * ChangeBatch through the SAME we_batch_begin + we_batch_row path used by
+ * MULTI_INSERT (no ChangeEvent, no SQL/op_text/attname, no second deform path).
+ * Accumulator bytes are charged to the shared 256MB batch budget so a runaway
+ * stream fails closed with buffer_overflow rather than via the old event path.
+ */
+typedef struct WeInsertAccum
+{
+	struct WeInsertAccum *next;
+	TransactionId xid;
+	Oid			relfile;
+	Oid			relid;
+	XLogRecPtr	first_lsn;
+	int			nrows;
+	int			roff_cap;	/* entries allocated in roff[] */
+	uint32	   *roff;		/* row i image at buf[roff[i]]..buf[roff[i+1]] */
+	char	   *buf;		/* reconstructed HeapTupleHeader images, back to back */
+	size_t		cap;		/* allocated buf bytes */
+	size_t		len;		/* used buf bytes */
+	size_t		payload;	/* sum of body bytes (varblob upper bound for begin) */
+	size_t		acct;		/* bytes charged to ctx->bbuf_bytes for this accumulator */
+} WeInsertAccum;
+
+/* charge accumulator growth against the shared batch budget; fail closed at cap */
+static bool
+we_iaccum_charge(WalExtractContext *ctx, size_t add)
+{
+	if (ctx->bbuf_bytes + add > (Size) WALEXTRACT_MAX_BUFFERED_BYTES)
+	{
+		ctx->status = WALEXTRACT_FATAL_BUFFER_OVERFLOW;
+		return false;
+	}
+	ctx->bbuf_bytes += add;
+	if (ctx->bbuf_bytes > ctx->bbuf_bytes_peak)
+		ctx->bbuf_bytes_peak = ctx->bbuf_bytes;
+	return true;
+}
+
+static WeInsertAccum *
+we_iaccum_get(WalExtractContext *ctx, TransactionId xid, Oid relfile, Oid relid)
+{
+	WeInsertAccum *a;
+
+	for (a = ctx->iacc_head; a != NULL; a = a->next)
+		if (a->xid == xid && a->relfile == relfile)
+			return a;
+	if (!we_iaccum_charge(ctx, sizeof(WeInsertAccum)))
+		return NULL;
+	a = (WeInsertAccum *) malloc(sizeof(WeInsertAccum));
+	if (a == NULL)
+	{
+		ctx->status = WALEXTRACT_FATAL_OOM;
+		return NULL;
+	}
+	memset(a, 0, sizeof(*a));
+	a->xid = xid;
+	a->relfile = relfile;
+	a->relid = relid;
+	a->first_lsn = ctx->cur_lsn;
+	a->acct = sizeof(WeInsertAccum);
+	if (ctx->iacc_tail == NULL)
+		ctx->iacc_head = ctx->iacc_tail = a;
+	else
+	{
+		ctx->iacc_tail->next = a;
+		ctx->iacc_tail = a;
+	}
+	return a;
+}
+
+/* append one reconstructed tuple (header + body) to the (xid,relfile) accumulator */
+static void
+we_iaccum_add(WalExtractContext *ctx, TransactionId xid, Oid relfile, Oid relid,
+			  uint16 im2, uint16 im, uint8 hoff, const char *body, Size bodylen)
+{
+	WeInsertAccum *a;
+	size_t		need = SizeofHeapTupleHeader + bodylen;
+	HeapTupleHeader htup;
+
+	if (bodylen > 2 * BLCKSZ - SizeofHeapTupleHeader)
+	{
+		/* implausibly large single tuple: refuse rather than mis-size */
+		we_batch_unsupported(ctx, WEB_SINGLE_INSERT_UNSUPPORTED);
+		return;
+	}
+	a = we_iaccum_get(ctx, xid, relfile, relid);
+	if (a == NULL)
+		return;					/* status already set (overflow/OOM) */
+
+	if (a->len + need > a->cap)
+	{
+		size_t		ncap = a->cap ? a->cap : 4096;
+		char	   *nbuf;
+
+		while (ncap < a->len + need)
+			ncap *= 2;
+		if (!we_iaccum_charge(ctx, ncap - a->cap))
+			return;
+		nbuf = (char *) realloc(a->buf, ncap);
+		if (nbuf == NULL)
+		{
+			ctx->status = WALEXTRACT_FATAL_OOM;
+			return;
+		}
+		a->buf = nbuf;
+		a->cap = ncap;
+	}
+	if (a->nrows + 2 > a->roff_cap)
+	{
+		int			nrc = a->roff_cap ? a->roff_cap : 64;
+		uint32	   *nro;
+
+		while (nrc < a->nrows + 2)
+			nrc *= 2;
+		if (!we_iaccum_charge(ctx, (size_t) (nrc - a->roff_cap) * sizeof(uint32)))
+			return;
+		nro = (uint32 *) realloc(a->roff, (size_t) nrc * sizeof(uint32));
+		if (nro == NULL)
+		{
+			ctx->status = WALEXTRACT_FATAL_OOM;
+			return;
+		}
+		a->roff = nro;
+		a->roff_cap = nrc;
+		if (a->nrows == 0)
+			a->roff[0] = 0;
+	}
+
+	htup = (HeapTupleHeader) (a->buf + a->len);
+	memset(htup, 0, SizeofHeapTupleHeader);
+	memcpy((char *) htup + SizeofHeapTupleHeader, body, bodylen);
+	htup->t_infomask2 = im2;
+	htup->t_infomask = im;
+	htup->t_hoff = hoff;
+	a->roff[a->nrows] = (uint32) a->len;
+	a->len += need;
+	a->roff[a->nrows + 1] = (uint32) a->len;
+	a->nrows++;
+	a->payload += bodylen;
+}
+
+static void
+we_iaccum_free(WalExtractContext *ctx, WeInsertAccum *a)
+{
+	ctx->bbuf_bytes -= a->acct;
+	free(a->buf);
+	free(a->roff);
+	free(a);
+}
+
+static void
+we_iaccum_unlink(WalExtractContext *ctx, WeInsertAccum *a, WeInsertAccum *prev)
+{
+	if (prev == NULL)
+		ctx->iacc_head = a->next;
+	else
+		prev->next = a->next;
+	if (ctx->iacc_tail == a)
+		ctx->iacc_tail = prev;
+}
+
+/* COMMIT: materialize each family accumulator into ONE ChangeBatch and deliver */
+static void
+we_flush_accums(WalExtractContext *ctx, TransactionId topxid,
+				const TransactionId *subxacts, int nsub, XLogRecPtr commit_lsn,
+				const xl_xact_parsed_commit *parsed)
+{
+	WeInsertAccum *a = ctx->iacc_head;
+	WeInsertAccum *prev = NULL;
+
+	while (a != NULL)
+	{
+		WeInsertAccum *next = a->next;
+
+		if (!we_xid_in_family(a->xid, topxid, subxacts, nsub))
+		{
+			prev = a;
+			a = next;
+			continue;
+		}
+
+		/*
+		 * Trust re-check at delivery time: a mid-transaction DROP COLUMN /
+		 * rewrite / opaque-guard invalidation flips the relfilenode out of USER
+		 * trust.  Never stale-decode accumulated rows -> fail closed.
+		 */
+		if (we_rel_trust(ctx, a->relfile) != WX_REL_USER)
+		{
+			we_batch_unsupported(ctx, WEB_UNKNOWN_DICTIONARY);
+			return;				/* leftover accumulators freed at teardown */
+		}
+
+		if (!we_commit_drops_relfile(ctx, parsed, a->relfile))
+		{
+			MineRelDesc *d = mine_desc_get(ctx, a->relid, false);
+			WeBufBatch *bb = we_batch_begin(ctx, a->relid, a->relfile, d,
+											a->nrows, a->payload);
+
+			if (bb == NULL)
+				return;			/* fail closed: buffer_overflow / OOM status set */
+			if (d != NULL)
+			{
+				int			row;
+
+				for (row = 0; row < a->nrows; row++)
+					we_batch_row(bb, d, row,
+								 (HeapTupleHeader) (a->buf + a->roff[row]));
+				bb->b.nrows = a->nrows;
+			}
+			bb->b.record_lsn = a->first_lsn;
+			bb->b.commit_lsn = commit_lsn;
+			ctx->batch_emit_cb(&bb->b, ctx->batch_emit_sink);
+			free(bb);
+		}
+		we_iaccum_unlink(ctx, a, prev);
+		we_iaccum_free(ctx, a);
+		a = next;
+	}
+}
+
+/* ABORT: drop family accumulators without delivery */
+static void
+we_discard_accums(WalExtractContext *ctx, TransactionId topxid,
+				  const TransactionId *subxacts, int nsub)
+{
+	WeInsertAccum *a = ctx->iacc_head;
+	WeInsertAccum *prev = NULL;
+
+	while (a != NULL)
+	{
+		WeInsertAccum *next = a->next;
+
+		if (we_xid_in_family(a->xid, topxid, subxacts, nsub))
+		{
+			we_iaccum_unlink(ctx, a, prev);
+			we_iaccum_free(ctx, a);
+		}
+		else
+			prev = a;
+		a = next;
+	}
+}
+
+static void
+we_iaccum_free_all(WalExtractContext *ctx)
+{
+	WeInsertAccum *a = ctx->iacc_head;
+
+	while (a != NULL)
+	{
+		WeInsertAccum *next = a->next;
+
+		free(a->buf);
+		free(a->roff);
+		free(a);
+		a = next;
+	}
+	ctx->iacc_head = ctx->iacc_tail = NULL;
+}
+
 /*
  * Batch mode is a machine stream and must never silently drop a user record it
  * cannot represent.  Record a fatal status + stable reason; walextract_record()
@@ -2175,6 +2445,8 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 							record->ReadRecPtr, &parsed);
 			we_flush_batches(ctx, topxid, parsed.subxacts, parsed.nsubxacts,
 							 record->ReadRecPtr, &parsed);
+			we_flush_accums(ctx, topxid, parsed.subxacts, parsed.nsubxacts,
+							 record->ReadRecPtr, &parsed);
 			we_apply_drop_boundaries(ctx, &parsed, record->ReadRecPtr, topxid);
 		}
 		else if (xact_op == XLOG_XACT_ABORT)
@@ -2185,6 +2457,7 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 			ParseAbortRecord(xact_info, xlrec, &parsed);
 			we_discard_family(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
 			we_discard_batches(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
+			we_discard_accums(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
 		}
 		else if (xact_op == XLOG_XACT_PREPARE ||
 				 xact_op == XLOG_XACT_COMMIT_PREPARED ||
@@ -2239,14 +2512,63 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		char	   *blkdata = XLogRecGetBlockData(record, 0, &datalen);
 
 		/*
-		 * Batch mode covers only HEAP2 MULTI_INSERT.  A single user INSERT
-		 * would otherwise be buffered as a ChangeEvent and then no-op delivered
-		 * (event sink is absent in batch mode), silently dropping a user row.
-		 * Single-INSERT coalescing is P3; until then, fail closed.
+		 * Machine batch path: a single user INSERT is reconstructed and appended
+		 * to the (xid,relfile) insert accumulator; the accumulator becomes one
+		 * ChangeBatch at COMMIT.  UNKNOWN fails closed (never guess "user");
+		 * INTERNAL/CATALOG fall through to the per-tuple learning path so the
+		 * dictionary keeps mining catalog inserts.
 		 */
-		if (ctx->batch_emit_cb &&
-			we_batch_user_dml_blocked(ctx, rloc.relNumber, WEB_SINGLE_INSERT_UNSUPPORTED))
-			return;
+		if (ctx->batch_emit_cb)
+		{
+			WalExtractRelTrust trust = we_rel_trust(ctx, rloc.relNumber);
+
+			if (trust == WX_REL_UNKNOWN)
+			{
+				we_batch_unsupported(ctx, WEB_UNKNOWN_DICTIONARY);
+				return;
+			}
+			if (trust == WX_REL_USER)
+			{
+				Oid			relfile = rloc.relNumber;
+				Oid			relid = mine_relfile_get(ctx, relfile);
+
+				if (blkdata == NULL)
+				{
+					char		pagebuf[BLCKSZ];
+
+					if (XLogRecHasBlockImage(record, 0) &&
+						RestoreBlockImage(record, 0, pagebuf))
+					{
+						ItemId		lp = PageGetItemId((Page) pagebuf, xlrec->offnum);
+
+						if (ItemIdIsNormal(lp))
+						{
+							HeapTupleHeader htup =
+								(HeapTupleHeader) PageGetItem((Page) pagebuf, lp);
+							Size		ilen = ItemIdGetLength(lp);
+
+							if (ilen >= SizeofHeapTupleHeader)
+								we_iaccum_add(ctx, ctx->cur_xid, relfile, relid,
+											  htup->t_infomask2, htup->t_infomask,
+											  htup->t_hoff,
+											  (char *) htup + SizeofHeapTupleHeader,
+											  ilen - SizeofHeapTupleHeader);
+						}
+					}
+					return;
+				}
+				{
+					xl_heap_header *xlhdr = (xl_heap_header *) blkdata;
+
+					we_iaccum_add(ctx, ctx->cur_xid, relfile, relid,
+								  xlhdr->t_infomask2, xlhdr->t_infomask, xlhdr->t_hoff,
+								  blkdata + SizeOfHeapHeader,
+								  datalen - SizeOfHeapHeader);
+				}
+				return;
+			}
+			/* INTERNAL / CATALOG: fall through to the learning path below */
+		}
 
 		if (blkdata == NULL)
 		{
@@ -2564,6 +2886,7 @@ walextract_context_free(WalExtractContext *ctx)
 	{
 		we_buf_free_all(ctx);
 		we_bbuf_free_all(ctx);
+		we_iaccum_free_all(ctx);
 		free(ctx);
 	}
 }
@@ -2582,6 +2905,7 @@ walextract_context_reset(WalExtractContext *ctx)
 
 	we_buf_free_all(ctx);		/* drop any open-transaction buffer first */
 	we_bbuf_free_all(ctx);
+	we_iaccum_free_all(ctx);
 	strlcpy(pg, ctx->pgdata, sizeof(pg));
 	memset(ctx, 0, sizeof(*ctx));
 	ctx->emit_cb = cb;

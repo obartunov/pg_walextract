@@ -58,9 +58,10 @@ SELECT pg_current_wal_lsn() AS d1 \gset
 SELECT nrows, ncols, schema_missing, payload_bytes
   FROM walextract_wal2batch(:'d0', :'d1');
 
--- case E: single user INSERT -> batch mode FAIL CLOSED while event mode is
--- unchanged (decodes the same INSERT).  Proves the two modes are independent
--- and that fail-closed is batch-mode-specific, not a loss of capability.
+-- case E: single user INSERT -> batch mode now accumulates it into one
+-- ChangeBatch (insert coverage v0); event mode is unchanged (decodes the same
+-- INSERT).  The in-range CREATE makes wxb_ev a learned USER relation, so the
+-- single INSERT is trusted and delivered as 1 batch at COMMIT.
 SELECT pg_current_wal_lsn() AS e0 \gset
 CREATE TABLE wxb_ev (a int, b int);
 INSERT INTO wxb_ev VALUES (1, 2);
