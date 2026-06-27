@@ -48,3 +48,13 @@ LANGUAGE C STRICT PARALLEL UNSAFE;
 
 REVOKE EXECUTE ON FUNCTION walextract_wal2event_count(pg_lsn, pg_lsn, boolean) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION walextract_wal2event_count(pg_lsn, pg_lsn, boolean) TO pg_read_server_files;
+
+-- Sidecar producer: capture the live catalog as a WX_SIDECAR v0 text blob that
+-- can later prime a decode of a WAL range starting at/after the snapshot LSN.
+CREATE FUNCTION walextract_export_dictionary()
+RETURNS text
+AS 'MODULE_PATHNAME', 'walextract_export_dictionary'
+LANGUAGE C VOLATILE PARALLEL UNSAFE;
+
+REVOKE EXECUTE ON FUNCTION walextract_export_dictionary() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION walextract_export_dictionary() TO pg_read_server_files;

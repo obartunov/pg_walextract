@@ -19,6 +19,7 @@
 #include "utils/acl.h"
 #include "port/pg_bitutils.h"
 #include "executor/spi.h"
+#include "utils/timestamp.h"
 
 #include "walextract_core.h"
 
@@ -226,6 +227,105 @@ prime_from_catalog(WalExtractContext *ctx)
 
 	SPI_finish();
 	walextract_set_dict_primed(ctx, true);
+}
+
+/*
+ * walextract_export_dictionary() -> text
+ *
+ * Capture the live catalog as a text "sidecar" (WX_SIDECAR v0) that can later
+ * prime a decode of a WAL range whose catalog is no longer current.  The
+ * snapshot_lsn is the current flush LSN: a consumer accepts the sidecar only
+ * for a range that STARTS at or after snapshot_lsn (capture-then-decode-later),
+ * never to reconstruct a diverged past catalog.
+ */
+PG_FUNCTION_INFO_V1(walextract_export_dictionary);
+Datum
+walextract_export_dictionary(PG_FUNCTION_ARGS)
+{
+	StringInfoData buf;
+	StringInfoData rels;
+	StringInfoData attrs;
+	uint64		nrels = 0;
+	uint64		nattrs = 0;
+	uint64		i;
+
+	initStringInfo(&buf);
+	initStringInfo(&rels);
+	initStringInfo(&attrs);
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		ereport(ERROR, (errmsg("walextract: SPI_connect failed in export")));
+
+	if (SPI_execute("SELECT relfilenode, oid, relkind, relname "
+					"FROM pg_catalog.pg_class WHERE relfilenode <> 0",
+					true, 0) == SPI_OK_SELECT)
+	{
+		TupleDesc	td = SPI_tuptable->tupdesc;
+
+		for (i = 0; i < SPI_processed; i++)
+		{
+			HeapTuple	t = SPI_tuptable->vals[i];
+			bool		isnull;
+			Oid			relfile = DatumGetObjectId(SPI_getbinval(t, td, 1, &isnull));
+			Oid			relid = DatumGetObjectId(SPI_getbinval(t, td, 2, &isnull));
+			char		relkind = DatumGetChar(SPI_getbinval(t, td, 3, &isnull));
+			char	   *relname = SPI_getvalue(t, td, 4);
+
+			appendStringInfo(&rels, "R %u %u %c %s\n",
+							 relfile, relid, relkind, relname ? relname : "");
+			if (relname)
+				pfree(relname);
+			nrels++;
+		}
+	}
+
+	if (SPI_execute("SELECT attrelid, attnum, atttypid, attlen, attbyval, "
+					"attalign, attisdropped, attname "
+					"FROM pg_catalog.pg_attribute WHERE attnum > 0",
+					true, 0) == SPI_OK_SELECT)
+	{
+		TupleDesc	td = SPI_tuptable->tupdesc;
+
+		for (i = 0; i < SPI_processed; i++)
+		{
+			HeapTuple	t = SPI_tuptable->vals[i];
+			bool		isnull;
+			Oid			attrelid = DatumGetObjectId(SPI_getbinval(t, td, 1, &isnull));
+			int16		attnum = DatumGetInt16(SPI_getbinval(t, td, 2, &isnull));
+			Oid			atttypid = DatumGetObjectId(SPI_getbinval(t, td, 3, &isnull));
+			int16		attlen = DatumGetInt16(SPI_getbinval(t, td, 4, &isnull));
+			bool		attbyval = DatumGetBool(SPI_getbinval(t, td, 5, &isnull));
+			char		attalign = DatumGetChar(SPI_getbinval(t, td, 6, &isnull));
+			bool		attisdropped = DatumGetBool(SPI_getbinval(t, td, 7, &isnull));
+			char	   *attname = SPI_getvalue(t, td, 8);
+
+			appendStringInfo(&attrs, "A %u %d %u %d %d %c %d %s\n",
+							 attrelid, attnum, atttypid, attlen,
+							 attbyval ? 1 : 0, attalign, attisdropped ? 1 : 0,
+							 attname ? attname : "");
+			if (attname)
+				pfree(attname);
+			nattrs++;
+		}
+	}
+
+	SPI_finish();
+
+	appendStringInfoString(&buf, "WX_SIDECAR 1\n");
+	appendStringInfo(&buf, "system_identifier " UINT64_FORMAT "\n",
+					 GetSystemIdentifier());
+	appendStringInfo(&buf, "source_db_oid %u\n", MyDatabaseId);
+	appendStringInfo(&buf, "snapshot_lsn %X/%X\n",
+					 LSN_FORMAT_ARGS(GetFlushRecPtr(NULL)));
+	appendStringInfo(&buf, "extracted_at " INT64_FORMAT "\n",
+					 (int64) GetCurrentTimestamp());
+	appendStringInfoString(&buf, "source live\n");
+	appendStringInfo(&buf, "counts " UINT64_FORMAT " " UINT64_FORMAT "\n",
+					 nrels, nattrs);
+	appendBinaryStringInfo(&buf, rels.data, rels.len);
+	appendBinaryStringInfo(&buf, attrs.data, attrs.len);
+
+	PG_RETURN_TEXT_P(cstring_to_text_with_len(buf.data, buf.len));
 }
 
 /* shared WAL scan in batch mode; ERRORs (fail-closed) if the core stops */
