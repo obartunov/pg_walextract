@@ -2507,9 +2507,14 @@ we_no_flag_reason(WalExtractContext *ctx, Oid relfile)
 {
 	const MineIdentEnt *e = mine_ident_find(ctx, relfile);
 
-	if (e != NULL &&
-		(e->relreplident == 'n' || (e->relreplident == 'd' && e->natts == 0)))
-		return WEB_IDENTITY_KEY_MISSING;
+	if (e != NULL)
+	{
+		if (e->relreplident == 'n')
+			return WEB_REPLICA_IDENTITY_NOTHING;
+		if (e->natts == 0 &&
+			(e->relreplident == 'd' || e->relreplident == 'i'))
+			return WEB_IDENTITY_KEY_MISSING;
+	}
 	return WEB_NO_EXPLICIT_OLD_IDENTITY;
 }
 

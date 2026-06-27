@@ -60,6 +60,8 @@ typedef enum WalChangeOp
 															 * next increment (temp dev guard) */
 #define WEB_IDENTITY_METADATA_MISSING	"identity_metadata_missing"	/* no v2 I record
 												 * for this relfile */
+#define WEB_REPLICA_IDENTITY_NOTHING	"replica_identity_nothing"	/* relreplident=n:
+												 * relation policy says no identity */
 #define WEB_IDENTITY_KEY_MISSING		"identity_key_missing"	/* metadata says no usable
 												 * identity key (e.g. DEFAULT
 												 * with no primary key) */
