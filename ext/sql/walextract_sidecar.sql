@@ -1,0 +1,97 @@
+-- Catalog Snapshot Sidecar Provider v0: producer + validated consumer +
+-- in-range invalidation.  Output is kept deterministic: variable LSNs / OIDs
+-- never reach the result columns (a classifier turns rejections into stable
+-- tokens, and only row counts / booleans / relation names are selected).
+CREATE EXTENSION walextract;
+
+-- Run batch decode and report a stable token instead of an LSN/OID-bearing
+-- message, so the expected output does not depend on run-time addresses.
+CREATE FUNCTION try_decode(s pg_lsn, e pg_lsn, sc text) RETURNS text AS $$
+DECLARE n bigint;
+BEGIN
+    SELECT total_rows INTO n FROM walextract_batch_stats(s, e, false, sc);
+    RETURN 'decoded ' || n;
+EXCEPTION WHEN OTHERS THEN
+    IF SQLERRM LIKE '%unknown_dictionary%'   THEN RETURN 'fail-closed unknown_dictionary';
+    ELSIF SQLERRM LIKE '%system_identifier%' THEN RETURN 'rejected system_identifier';
+    ELSIF SQLERRM LIKE '%source_db_oid%'     THEN RETURN 'rejected source_db_oid';
+    ELSIF SQLERRM LIKE '%snapshot_lsn%'      THEN RETURN 'rejected snapshot_lsn';
+    ELSIF SQLERRM LIKE '%magic%'             THEN RETURN 'rejected bad_magic';
+    ELSE RETURN 'rejected other';
+    END IF;
+END$$ LANGUAGE plpgsql;
+
+-- Pre-range relations: created BEFORE the captured snapshot, so without a
+-- sidecar their in-range data is UNKNOWN to the dictionary (fail-closed).
+CREATE TABLE t_norm (a int, b int);
+CREATE TABLE t_ext  (id int, big text);
+ALTER TABLE t_ext ALTER COLUMN big SET STORAGE EXTERNAL;
+CREATE TABLE t_drop (a int, b int, c int);
+CREATE TABLE t_trunc(a int, b int);
+
+-- Capture one sidecar covering all four relations.
+CREATE TABLE _sc(s text);
+INSERT INTO _sc SELECT walextract_export_dictionary();
+
+-- ============================ case 1 ============================
+-- valid sidecar + pre-range normal table -> decodes; no sidecar -> fail-closed.
+SELECT pg_switch_wal() \gset
+SELECT pg_current_wal_lsn() AS s1 \gset
+COPY t_norm FROM PROGRAM 'seq 1 300 | awk ''{print $1"\t"$1}''';
+SELECT pg_current_wal_lsn() AS e1 \gset
+SELECT 'case1 no-sidecar    ' AS label, try_decode(:'s1', :'e1', '') AS result;
+SELECT 'case1 valid-sidecar ' AS label, try_decode(:'s1', :'e1', (SELECT s FROM _sc)) AS result;
+
+-- ============================ case 2 ============================
+-- valid sidecar + pre-range external-TOAST relation: rows are attributed to the
+-- (primed) relation and flagged toast_external; no over-production.
+SELECT pg_switch_wal() \gset
+SELECT pg_current_wal_lsn() AS s2 \gset
+INSERT INTO t_ext VALUES (1, repeat('A', 4000));
+SELECT pg_current_wal_lsn() AS e2 \gset
+SELECT count(*)                                   AS ext_rows,
+       bool_and(NOT complete)                     AS all_incomplete,
+       bool_and('toast_external' = ANY(reasons))  AS all_toast_external
+  FROM walextract_wal2sql(:'s2', :'e2', false, (SELECT s FROM _sc))
+ WHERE op = 'INSERT' AND relation = 't_ext';
+
+-- ===================== cases 3..7 (provenance) =====================
+-- reuse case-1 range r1; mutate the captured sidecar to force each rejection.
+SELECT 'case3 no-sidecar      ' AS label, try_decode(:'s1', :'e1', '') AS result;
+SELECT 'case4 wrong-sysid     ' AS label,
+       try_decode(:'s1', :'e1', (SELECT regexp_replace(s,'system_identifier [0-9]+','system_identifier 1') FROM _sc)) AS result;
+SELECT 'case5 wrong-db        ' AS label,
+       try_decode(:'s1', :'e1', (SELECT regexp_replace(s,'source_db_oid [0-9]+','source_db_oid 1') FROM _sc)) AS result;
+SELECT 'case6 snapshot-after  ' AS label,
+       try_decode(:'s1', :'e1', (SELECT regexp_replace(s,'snapshot_lsn [0-9A-F]+/[0-9A-F]+','snapshot_lsn FFFFFFFF/FFFFFFFF') FROM _sc)) AS result;
+SELECT 'case7 corrupted-magic ' AS label,
+       try_decode(:'s1', :'e1', (SELECT regexp_replace(s,'WX_SIDECAR 1','GARBAGE') FROM _sc)) AS result;
+
+-- ============================ case 8 ============================
+-- sidecar-primed + in-range DROP COLUMN -> descriptor invalidated, post-drop
+-- inserts fail closed (no stale decode).  This is the @Teodor red->green case
+-- driven through the sidecar priming path.
+SELECT pg_switch_wal() \gset
+SELECT pg_current_wal_lsn() AS s8 \gset
+COPY t_drop FROM PROGRAM 'seq 1 200 | awk ''{print $1"\t"$1"\t"$1}''';
+ALTER TABLE t_drop DROP COLUMN c;
+COPY t_drop(a,b) FROM PROGRAM 'seq 1 200 | awk ''{print $1"\t"$1}''';
+SELECT pg_current_wal_lsn() AS e8 \gset
+SELECT 'case8 drop-column ' AS label, try_decode(:'s8', :'e8', (SELECT s FROM _sc)) AS result;
+
+-- ============================ case 9 ============================
+-- sidecar-primed + in-range TRUNCATE -> relfilenode boundary: the old
+-- relfilenode is dropped and the new one is UNKNOWN to the sidecar, so
+-- post-truncate inserts fail closed.  (COPY is used so the post-truncate write
+-- is a multi-insert that reaches the dictionary check rather than the
+-- single-insert batch guard.)
+SELECT pg_switch_wal() \gset
+SELECT pg_current_wal_lsn() AS s9 \gset
+COPY t_trunc FROM PROGRAM 'seq 1 100 | awk ''{print $1"\t"$1}''';
+TRUNCATE t_trunc;
+COPY t_trunc FROM PROGRAM 'seq 1 100 | awk ''{print $1"\t"$1}''';
+SELECT pg_current_wal_lsn() AS e9 \gset
+SELECT 'case9 truncate ' AS label, try_decode(:'s9', :'e9', (SELECT s FROM _sc)) AS result;
+
+DROP FUNCTION try_decode(pg_lsn, pg_lsn, text);
+DROP EXTENSION walextract;
