@@ -11,8 +11,8 @@ BEGIN
     RETURN format('batches=%s rows=%s ext=%s', r.n_batches, r.total_rows, r.any_external_toast);
 EXCEPTION WHEN OTHERS THEN
     IF    SQLERRM LIKE '%unknown_dictionary%'         THEN RETURN 'fail-closed unknown_dictionary';
-    ELSIF SQLERRM LIKE '%update_unsupported%'         THEN RETURN 'fail-closed update_unsupported';
-    ELSIF SQLERRM LIKE '%delete_unsupported%'         THEN RETURN 'fail-closed delete_unsupported';
+    ELSIF SQLERRM LIKE '%hot_update_unsupported%'     THEN RETURN 'fail-closed hot_update_unsupported';
+    ELSIF SQLERRM LIKE '%no_explicit_old_identity%'   THEN RETURN 'fail-closed no_explicit_old_identity';
     ELSIF SQLERRM LIKE '%buffer_overflow%'            THEN RETURN 'fail-closed buffer_overflow';
     ELSIF SQLERRM LIKE '%single_insert_unsupported%'  THEN RETURN 'fail-closed single_insert_unsupported';
     ELSE  RETURN 'fail-closed other';
@@ -152,9 +152,9 @@ INSERT INTO b9u VALUES (1,1);
 UPDATE b9u SET b = b + 1 WHERE a = 1;
 SELECT pg_current_wal_lsn() AS e \gset
 SELECT 'B9-update' AS case, b(:'s', :'e') AS result;
-   case    |             result             
------------+--------------------------------
- B9-update | fail-closed update_unsupported
+   case    |               result               
+-----------+------------------------------------
+ B9-update | fail-closed hot_update_unsupported
 (1 row)
 
 SELECT pg_current_wal_lsn() AS s \gset
@@ -163,9 +163,9 @@ INSERT INTO b9d VALUES (1,1);
 DELETE FROM b9d WHERE a = 1;
 SELECT pg_current_wal_lsn() AS e \gset
 SELECT 'B9-delete' AS case, b(:'s', :'e') AS result;
-   case    |             result             
------------+--------------------------------
- B9-delete | fail-closed delete_unsupported
+   case    |                result                
+-----------+--------------------------------------
+ B9-delete | fail-closed no_explicit_old_identity
 (1 row)
 
 DROP FUNCTION b(pg_lsn, pg_lsn, text);

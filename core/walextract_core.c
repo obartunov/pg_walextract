@@ -2397,6 +2397,39 @@ we_batch_user_dml_blocked(WalExtractContext *ctx, Oid relfile, const char *op_re
 	return false;
 }
 
+/*
+ * Explicit-evidence identity classifier for a user UPDATE record.  The machine
+ * path may only treat a row as identity-safe when the WAL record itself carries
+ * old identity (CONTAINS_OLD_TUPLE for REPLICA IDENTITY FULL, CONTAINS_OLD_KEY
+ * for DEFAULT/INDEX with the key explicitly logged).  Anything else fails closed:
+ *   - HOT update: deferred in v0 (hot_update_unsupported);
+ *   - no CONTAINS_OLD_*: no_explicit_old_identity -- the central safety rule;
+ *     never infer identity from the new tuple, since at wal_level=replica the
+ *     record is byte-indistinguishable from a logical key-unchanged update and
+ *     the old identity was simply not logged.
+ * When old identity IS explicitly present the row is identity-eligible; emission
+ * via ChangeDmlBatch is the next increment, so v0 returns the dml_emit_pending
+ * dev guard rather than silently dropping or guessing.
+ */
+static const char *
+we_classify_update(uint8 flags, uint8 op)
+{
+	if (op == XLOG_HEAP_HOT_UPDATE)
+		return WEB_HOT_UPDATE_UNSUPPORTED;
+	if (flags & (XLH_UPDATE_CONTAINS_OLD_TUPLE | XLH_UPDATE_CONTAINS_OLD_KEY))
+		return WEB_DML_EMIT_PENDING;
+	return WEB_NO_EXPLICIT_OLD_IDENTITY;
+}
+
+/* Explicit-evidence identity classifier for a user DELETE record. */
+static const char *
+we_classify_delete(uint8 flags)
+{
+	if (flags & (XLH_DELETE_CONTAINS_OLD_TUPLE | XLH_DELETE_CONTAINS_OLD_KEY))
+		return WEB_DML_EMIT_PENDING;
+	return WEB_NO_EXPLICIT_OLD_IDENTITY;
+}
+
 /* ===================== record dispatch ===================== */
 
 void
@@ -2718,7 +2751,8 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 
 		/* batch mode: user UPDATE is not representable as a ChangeBatch -> fail closed */
 		if (ctx->batch_emit_cb &&
-			we_batch_user_dml_blocked(ctx, rloc.relNumber, WEB_UPDATE_UNSUPPORTED))
+			we_batch_user_dml_blocked(ctx, rloc.relNumber,
+									 we_classify_update(xlrec->flags, op)))
 			return;
 
 		if (!mine_is_catalog(ctx, rloc.relNumber))
@@ -2833,7 +2867,8 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 
 		/* batch mode: user DELETE is not representable as a ChangeBatch -> fail closed */
 		if (ctx->batch_emit_cb &&
-			we_batch_user_dml_blocked(ctx, rloc.relNumber, WEB_DELETE_UNSUPPORTED))
+			we_batch_user_dml_blocked(ctx, rloc.relNumber,
+									 we_classify_delete(xlrec->flags)))
 			return;
 
 		if (!mine_is_catalog(ctx, rloc.relNumber))

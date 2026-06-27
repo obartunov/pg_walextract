@@ -12,8 +12,8 @@ BEGIN
     RETURN format('batches=%s rows=%s ext=%s', r.n_batches, r.total_rows, r.any_external_toast);
 EXCEPTION WHEN OTHERS THEN
     IF    SQLERRM LIKE '%unknown_dictionary%'         THEN RETURN 'fail-closed unknown_dictionary';
-    ELSIF SQLERRM LIKE '%update_unsupported%'         THEN RETURN 'fail-closed update_unsupported';
-    ELSIF SQLERRM LIKE '%delete_unsupported%'         THEN RETURN 'fail-closed delete_unsupported';
+    ELSIF SQLERRM LIKE '%hot_update_unsupported%'     THEN RETURN 'fail-closed hot_update_unsupported';
+    ELSIF SQLERRM LIKE '%no_explicit_old_identity%'   THEN RETURN 'fail-closed no_explicit_old_identity';
     ELSIF SQLERRM LIKE '%buffer_overflow%'            THEN RETURN 'fail-closed buffer_overflow';
     ELSIF SQLERRM LIKE '%single_insert_unsupported%'  THEN RETURN 'fail-closed single_insert_unsupported';
     ELSE  RETURN 'fail-closed other';

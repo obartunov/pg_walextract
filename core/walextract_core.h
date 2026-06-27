@@ -45,6 +45,20 @@ typedef enum WalChangeOp
 #define WEB_UNKNOWN_DICTIONARY			"unknown_dictionary"	/* machine mode: relation
 																 * not trusted (unprimed) */
 
+/*
+ * UPDATE/DELETE machine identity reasons (explicit-evidence policy v0).
+ * A row is identity-safe only when the WAL record itself carries old identity
+ * (XLH_*_CONTAINS_OLD_TUPLE / _OLD_KEY).  A bare new-tuple key is NOT identity:
+ * at wal_level=replica no old identity is logged, and that record cannot be
+ * distinguished from a logical key-unchanged update, so inferring identity from
+ * the new tuple alone would silently corrupt on apply.
+ */
+#define WEB_NO_EXPLICIT_OLD_IDENTITY	"no_explicit_old_identity"	/* no CONTAINS_OLD_* */
+#define WEB_HOT_UPDATE_UNSUPPORTED		"hot_update_unsupported"
+#define WEB_DML_EMIT_PENDING			"dml_emit_pending"	/* explicit identity present;
+															 * ChangeDmlBatch emission is the
+															 * next increment (temp dev guard) */
+
 #define WALEXTRACT_MAX_REASONS	6
 #define WALEXTRACT_MAX_COLS		80
 
