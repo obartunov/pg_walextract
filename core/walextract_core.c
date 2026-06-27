@@ -973,6 +973,111 @@ mine_desc_invalidate(WalExtractContext *ctx, Oid relid)
 	}
 }
 
+/*
+ * Invalidate every dictionary entry for a relid: descriptor + all relmap
+ * entries mapping to it.  After this, we_rel_trust() returns UNKNOWN for the
+ * relation's relfilenode -> machine mode fails closed, event marks
+ * unknown_dictionary.  Used when an in-range catalog mutation changes a
+ * relation's metadata and we cannot safely re-learn it (v0: invalidate, never
+ * decode with stale metadata).
+ */
+static void
+mine_invalidate_relid(WalExtractContext *ctx, Oid relid)
+{
+	int			i;
+
+	if (relid == InvalidOid)
+		return;
+	mine_desc_invalidate(ctx, relid);
+	for (i = 0; i < MINE_NREL; i++)
+	{
+		MineRelMapEnt *e = &ctx->relfile[i];
+
+		if (e->used && !e->invalid && e->relid == relid)
+			e->invalid = true;
+	}
+}
+
+/*
+ * Conservative whole-dictionary invalidation: mark every relmap entry and
+ * descriptor invalid and clear the primed flag, so we_rel_trust() returns
+ * UNKNOWN for everything and machine mode fails closed from here on.
+ *
+ * Used only for the opaque in-range pg_attribute UPDATE case: when a relation's
+ * pg_attribute row was written BEFORE the decoded range (a primed/pre-range
+ * relation), an in-range UPDATE to it is prefix/suffix-compressed against an old
+ * tuple we never cached, so the new tuple -- and even its attrelid -- cannot be
+ * reconstructed.  We cannot identify which relation changed, so we cannot apply
+ * the precise per-field check; the only safe action is to stop trusting the
+ * dictionary.  (Precise mine_catalog_attr_mutation() still handles every case
+ * where the new tuple IS reconstructable, i.e. in-range-learned relations.)
+ */
+static void
+mine_invalidate_all(WalExtractContext *ctx)
+{
+	int			i;
+
+	for (i = 0; i < MINE_NREL; i++)
+		if (ctx->relfile[i].used)
+			ctx->relfile[i].invalid = true;
+	for (i = 0; i < MINE_NDESC; i++)
+		if (ctx->desc[i].used)
+			ctx->desc[i].invalid = true;
+	walextract_set_dict_primed(ctx, false);
+}
+
+/*
+ * In-range pg_attribute UPDATE: decide whether the existing mined descriptor is
+ * still safe, using the NEW tuple only as evidence (this is invalidate-only --
+ * we never re-learn the descriptor from a catalog UPDATE in v0).
+ *
+ * Only fields that affect tuple deform / typed raw layout invalidate the mined
+ * descriptor.  attstorage and attname are intentionally ignored here: storage
+ * affects future TOAST policy, not the physical layout contract; attname is
+ * forensic label metadata.  (atttypmod / attcollation / stats are likewise not
+ * layout-relevant for v0.)  If any decode-relevant field changed (DROP COLUMN
+ * flips attisdropped; an in-place type change moves atttypid/attlen/attbyval/
+ * attalign), invalidate the relation so machine mode fails closed.
+ *
+ * pg_class is NOT handled: relation drop/rewrite is covered by the smgr
+ * rewrite/drop boundary, and other pg_class UPDATEs are benign.
+ */
+static void
+mine_catalog_attr_mutation(WalExtractContext *ctx, Oid catalog_relfile,
+						   const char *newdata, uint32 newlen)
+{
+	Form_pg_attribute f;
+	MineRelDesc *d;
+	int			i;
+
+	if (catalog_relfile != ctx->pgattr_fn)
+		return;
+	if (newdata == NULL || newlen < ATTRIBUTE_FIXED_PART_SIZE)
+		return;					/* cannot read the updated attribute (truncated):
+								 * decode-relevant changes are small and always
+								 * reconstruct, so leave the dictionary as-is */
+	f = (Form_pg_attribute) newdata;
+	if (f->attnum <= 0)
+		return;
+	d = mine_desc_get(ctx, f->attrelid, false);
+	if (d == NULL || d->invalid)
+		return;					/* relation not tracked / already invalid */
+	for (i = 0; i < d->ncols; i++)
+	{
+		MineCol    *c = &d->cols[i];
+
+		if (c->attnum != f->attnum)
+			continue;
+		if (c->attisdropped != f->attisdropped ||
+			c->atttypid != f->atttypid ||
+			c->attlen != f->attlen ||
+			c->attbyval != f->attbyval ||
+			c->attalign != f->attalign)
+			mine_invalidate_relid(ctx, f->attrelid);
+		return;
+	}
+}
+
 static void
 mine_desc_add_col(WalExtractContext *ctx, Oid relid, int16 attnum, Oid atttypid,
 				  int16 attlen, bool attbyval, char attalign, bool attisdropped,
@@ -2353,9 +2458,26 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 			{
 				mine_identity(ctx, rloc.relNumber, nud, newid, sizeof(newid));
 				mine_dict_put(ctx, rloc.relNumber, blk, xlrec->new_offnum, nud, nlen);
+				mine_catalog_attr_mutation(ctx, rloc.relNumber, nud, nlen);
 			}
 			else if (catalog_trunc)
+			{
 				strlcpy(newid, "<truncated>", sizeof(newid));
+
+				/*
+				 * Opaque in-range pg_attribute UPDATE: the new tuple could not
+				 * be reconstructed (no cached old tuple -> the relation is
+				 * pre-range / primed).  We cannot tell whether a decode-relevant
+				 * field changed, so fail closed conservatively for the rest of
+				 * the range rather than keep decoding with possibly-stale
+				 * descriptors.  pg_class is excluded: its opaque in-range
+				 * UPDATEs (relfrozenxid / relpages / stats from autovacuum) do
+				 * not change the deform contract, and real drops/rewrites are
+				 * handled by the smgr rewrite/drop boundary.
+				 */
+				if (rloc.relNumber == ctx->pgattr_fn)
+					mine_invalidate_all(ctx);
+			}
 		}
 		if (olde)
 			mine_dict_del(ctx, rloc.relNumber, oldblk, xlrec->old_offnum);
