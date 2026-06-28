@@ -1,0 +1,115 @@
+-- 2c ChangeDmlBatch machine path (UPDATE/DELETE emission).  These run at the
+-- suite's wal_level (replica), where PostgreSQL logs NO old identity for
+-- UPDATE/DELETE, so the emission path cannot reach decoded_identity_ready and
+-- must fail closed with the same precise reasons as the classifier -- proving
+-- the DML-batch mode is wired and never emits without explicit identity.  It
+-- also proves the 2c mixed-family rule: a user INSERT in DML-batch mode fails
+-- closed (no partial apply-safe transaction).  The positive emission paths
+-- (old key / old tuple present, typed ChangeDmlBatch with new row) need a
+-- logical cluster and are exercised in the runtime probe, not here.  Output is
+-- deterministic: a wrapper turns the fail-closed reason into a stable token; no
+-- LSN/OID/xid reaches a result column.  NOTE: in DML-batch mode a user INSERT
+-- fails closed, so each fail-closed UPDATE/DELETE range begins AFTER its setup
+-- INSERTs (mirroring the logical probe); the two insert cases set the range to
+-- include the INSERT on purpose.
+CREATE EXTENSION walextract;
+
+CREATE FUNCTION dmlb_reason(s pg_lsn, e pg_lsn) RETURNS text AS $$
+BEGIN
+    PERFORM n_batches FROM walextract_dmlbatch_stats(s, e, true, '');
+    RETURN 'emitted (no fail-closed)';
+EXCEPTION WHEN OTHERS THEN
+    RETURN regexp_replace(SQLERRM, '^walextract dmlbatch mode stopped: ', '');
+END$$ LANGUAGE plpgsql;
+
+CREATE FUNCTION dmlb_reason_np(s pg_lsn, e pg_lsn) RETURNS text AS $$
+BEGIN
+    PERFORM n_batches FROM walextract_dmlbatch_stats(s, e);
+    RETURN 'emitted (no fail-closed)';
+EXCEPTION WHEN OTHERS THEN
+    RETURN regexp_replace(SQLERRM, '^walextract dmlbatch mode stopped: ', '');
+END$$ LANGUAGE plpgsql;
+
+-- DB1: non-HOT, key-UNCHANGED UPDATE -> no old identity -> no_explicit_old_identity.
+CREATE TABLE dbt1(id int primary key, v int);
+CREATE INDEX dbt1_v ON dbt1(v);
+INSERT INTO dbt1 VALUES (1,1),(2,2),(3,3);
+SELECT pg_current_wal_lsn() AS s \gset
+UPDATE dbt1 SET v = v + 100 WHERE id = 1;
+SELECT pg_current_wal_lsn() AS e \gset
+SELECT 'DB1 update-keyunchanged' AS case, dmlb_reason(:'s', :'e') AS reason;
+
+-- DB2: DELETE on a primary-key table -> no old key at replica -> fail closed.
+CREATE TABLE dbt2(id int primary key, v int);
+INSERT INTO dbt2 VALUES (1,1),(2,2);
+SELECT pg_current_wal_lsn() AS s \gset
+DELETE FROM dbt2 WHERE id = 1;
+SELECT pg_current_wal_lsn() AS e \gset
+SELECT 'DB2 delete-pk' AS case, dmlb_reason(:'s', :'e') AS reason;
+
+-- DB3: HOT update (unindexed column, page room) -> hot_update_unsupported.
+CREATE TABLE dbt3(id int primary key, v int);
+INSERT INTO dbt3 VALUES (1,1);
+SELECT pg_current_wal_lsn() AS s \gset
+UPDATE dbt3 SET v = v + 1 WHERE id = 1;
+SELECT pg_current_wal_lsn() AS e \gset
+SELECT 'DB3 hot-update' AS case, dmlb_reason(:'s', :'e') AS reason;
+
+-- DB4: REPLICA IDENTITY NOTHING, DELETE -> replica_identity_nothing.
+CREATE TABLE dbt4(id int primary key, v int);
+ALTER TABLE dbt4 REPLICA IDENTITY NOTHING;
+INSERT INTO dbt4 VALUES (1,1);
+SELECT pg_current_wal_lsn() AS s \gset
+DELETE FROM dbt4 WHERE id = 1;
+SELECT pg_current_wal_lsn() AS e \gset
+SELECT 'DB4 nothing-delete' AS case, dmlb_reason(:'s', :'e') AS reason;
+
+-- DB5: DEFAULT, no PK, UPDATE indexed col -> identity_key_missing.
+CREATE TABLE dbt5(id int, v int);
+CREATE INDEX dbt5_v ON dbt5(v);
+INSERT INTO dbt5 VALUES (5,5);
+SELECT pg_current_wal_lsn() AS s \gset
+UPDATE dbt5 SET v = v + 1 WHERE id = 5;
+SELECT pg_current_wal_lsn() AS e \gset
+SELECT 'DB5 no-pk-update' AS case, dmlb_reason(:'s', :'e') AS reason;
+
+-- DB6: a user INSERT in DML-batch mode -> mixed-family rule fails closed
+-- (range deliberately includes the INSERT).
+CREATE TABLE dbt6(id int primary key, v int);
+SELECT pg_current_wal_lsn() AS s \gset
+INSERT INTO dbt6 VALUES (1,1);
+SELECT pg_current_wal_lsn() AS e \gset
+SELECT 'DB6 user-insert' AS case, dmlb_reason(:'s', :'e') AS reason;
+
+-- DB7: one xid mixing user INSERT + UPDATE -> fail closed (no partial family).
+CREATE TABLE dbt7(id int primary key, v int);
+INSERT INTO dbt7 VALUES (1,1);
+SELECT pg_current_wal_lsn() AS s \gset
+BEGIN;
+INSERT INTO dbt7 VALUES (2,2);
+UPDATE dbt7 SET v = v + 1 WHERE id = 1;
+COMMIT;
+SELECT pg_current_wal_lsn() AS e \gset
+SELECT 'DB7 mixed-insert-dml' AS case, dmlb_reason(:'s', :'e') AS reason;
+
+-- DB8: pre-range table, UPDATE without prime -> dictionary fails first.
+CREATE TABLE dbt8(id int primary key, v int);
+CREATE INDEX dbt8_v ON dbt8(v);
+INSERT INTO dbt8 VALUES (1,1);
+SELECT pg_current_wal_lsn() AS s \gset
+UPDATE dbt8 SET v = v + 100 WHERE id = 1;
+SELECT pg_current_wal_lsn() AS e \gset
+SELECT 'DB8 update-unprimed' AS case, dmlb_reason_np(:'s', :'e') AS reason;
+
+-- The typed-shape SRF exposes the documented columns and returns no rows when
+-- nothing emits (a DDL-only range): shape check only, no values.
+CREATE TABLE dbt9(id int primary key, v int);
+SELECT pg_current_wal_lsn() AS s \gset
+ALTER TABLE dbt9 ADD COLUMN w int;
+SELECT pg_current_wal_lsn() AS e \gset
+SELECT op, identity_source, nident, has_new_row, nnew, toast_external, incomplete
+FROM walextract_wal2dmlbatch(:'s', :'e', true, '');
+
+DROP FUNCTION dmlb_reason(pg_lsn, pg_lsn);
+DROP FUNCTION dmlb_reason_np(pg_lsn, pg_lsn);
+DROP EXTENSION walextract;

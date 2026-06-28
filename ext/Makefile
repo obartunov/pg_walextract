@@ -3,7 +3,7 @@ OBJS = walextract_ext.o walextract_core.o
 EXTENSION = walextract
 DATA = walextract--1.0.sql
 PGFILEDESC = "walextract - mine DDL/DML effects from WAL"
-REGRESS = walextract walextract_txn walextract_boundary walextract_sidecar walextract_insert walextract_dml walextract_dml_sidecar walextract_batch
+REGRESS = walextract walextract_txn walextract_boundary walextract_sidecar walextract_insert walextract_dml walextract_dml_sidecar walextract_dml_batch walextract_batch
 
 # Core source lives in ../core (sibling dir in the distributed package).
 # No hardcoded PG_CONFIG: override via command line or environment.
