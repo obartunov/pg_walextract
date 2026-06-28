@@ -66,6 +66,27 @@ typedef enum WalChangeOp
 												 * identity key (e.g. DEFAULT
 												 * with no primary key) */
 
+/*
+ * 2b read-only decode outcomes.  Reached only after we_identity_gate returned
+ * WEB_DML_EMIT_PENDING for a trusted USER relation (record carried explicit
+ * CONTAINS_OLD_TUPLE/_OLD_KEY).  The old-identity payload is reconstructed
+ * read-only by mirroring DecodeXLogTuple and deformed against the trusted
+ * descriptor to prove the identity material is fully present.  No emission,
+ * no reassembly, no TOAST fetch, no new-tuple inference: decode either proves
+ * the identity material decodable (decoded_identity_ready, still gated for 2c
+ * emission) or fails closed with one of the named reasons below.
+ */
+#define WEB_DECODED_IDENTITY_READY		"decoded_identity_ready"		/* old key/tuple
+												 * fully decoded + validated; emission is 2c */
+#define WEB_IDENTITY_EXTERNAL_TOAST		"identity_external_toast"	/* an identity datum is
+												 * an on-disk TOAST pointer (not reassembled) */
+#define WEB_IDENTITY_INCOMPLETE			"identity_incomplete"		/* payload underflows
+												 * the declared tuple layout */
+#define WEB_TUPLE_RECONSTRUCTION_UNSUPPORTED	"tuple_reconstruction_unsupported"	/* no
+												 * usable descriptor to deform against */
+#define WEB_DESCRIPTOR_INVALIDATED		"descriptor_invalidated"	/* descriptor invalidated
+												 * at a rewrite/drop boundary */
+
 #define WALEXTRACT_MAX_REASONS	6
 #define WALEXTRACT_MAX_COLS		80
 

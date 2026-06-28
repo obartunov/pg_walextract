@@ -2550,6 +2550,263 @@ we_classify_delete(WalExtractContext *ctx, Oid relfile, uint8 flags)
 	return we_no_flag_reason(ctx, relfile);
 }
 
+/* is descriptor attnum `attnum` one of the relation's identity-key columns? */
+static bool
+we_ident_is_key_att(const MineIdentEnt *id, int16 attnum)
+{
+	int			k;
+
+	for (k = 0; k < id->natts; k++)
+		if (id->atts[k] == attnum)
+			return true;
+	return false;
+}
+
+/*
+ * 2b: read-only decode + validation of explicit old identity.
+ *
+ * Reached ONLY when we_classify_*() returned WEB_DML_EMIT_PENDING for a trusted
+ * USER relation -- i.e. the WAL record carried CONTAINS_OLD_TUPLE/_OLD_KEY and
+ * the per-relation identity metadata permits proceeding.  This mirrors
+ * DecodeXLogTuple() (replication/logical/decode.c) READ-ONLY: it reconstructs
+ * the old-identity HeapTupleHeader from the record's old-identity payload and
+ * deforms it against the trusted descriptor to prove every identity value is
+ * present, in-bounds, and not external/incomplete.  It performs NO reassembly,
+ * NO TOAST fetch, NO new-tuple inference, and emits NOTHING (emission is 2c).
+ *
+ * Verified vs decode.c (PG 19beta1):
+ *   DELETE old identity: (char *) xlrec + SizeOfHeapDelete,
+ *                        len = XLogRecGetDataLen - SizeOfHeapDelete
+ *   UPDATE old identity: XLogRecGetData(r) + SizeOfHeapUpdate,
+ *                        len = XLogRecGetDataLen - SizeOfHeapUpdate
+ *   payload form (DecodeXLogTuple): xl_heap_header (SizeOfHeapHeader) then
+ *   tuple bytes; reconstructed t_len = (len - SizeOfHeapHeader) +
+ *   SizeofHeapTupleHeader, header fields copied from xl_heap_header.
+ *
+ * key_required == true  -> OLD_KEY: identity is the key columns (ExtractReplica-
+ *   Identity built the key tuple over the full descriptor with non-key columns
+ *   NULLed), so only the identity attnums must be non-null/present.
+ * key_required == false -> OLD_TUPLE (REPLICA IDENTITY FULL): the whole old row
+ *   is identity material; every reached column must decode in-bounds.
+ *
+ * Returns one of:
+ *   decoded_identity_ready            - identity material fully decodable
+ *   identity_external_toast           - an identity datum is an on-disk TOAST ptr
+ *   identity_incomplete               - payload underflows the declared layout
+ *   tuple_reconstruction_unsupported  - no usable descriptor to deform against
+ *   descriptor_invalidated            - descriptor invalidated at a boundary
+ */
+static const char *
+we_decode_old_identity(WalExtractContext *ctx, XLogReaderState *record,
+					   Oid relfile, bool is_delete, bool key_required)
+{
+	const MineIdentEnt *id = mine_ident_find(ctx, relfile);
+	Oid			relid = mine_relfile_get(ctx, relfile);
+	MineRelDesc *d = mine_desc_get(ctx, relid, false);
+	char	   *data = XLogRecGetData(record);
+	uint32		reclen = XLogRecGetDataLen(record);
+	uint32		fixedsz = is_delete ? SizeOfHeapDelete : SizeOfHeapUpdate;
+	char	   *payload;
+	uint32		paylen;
+	xl_heap_header xlhdr;
+	int			datalen;
+	/* aligned reconstruction buffer (mirrors DecodeXLogTuple target storage) */
+	union
+	{
+		double		force_align;
+		char		bytes[SizeofHeapTupleHeader + MaxHeapTupleSize];
+	}			tup;
+	HeapTupleHeader htup = (HeapTupleHeader) tup.bytes;
+	int			natts;
+	bool		hasnulls;
+	uint8	   *bp;
+	char	   *tp;
+	long		bodylen;
+	long		off = 0;
+	int			i;
+	int			keyseen = 0;
+
+	/* must have identity metadata and a usable descriptor to deform against */
+	if (id == NULL)
+		return WEB_IDENTITY_METADATA_MISSING;	/* unreachable via gate, defensive */
+	if (d == NULL)
+		return WEB_TUPLE_RECONSTRUCTION_UNSUPPORTED;
+	if (d->invalid)
+		return WEB_DESCRIPTOR_INVALIDATED;
+
+	/* locate old-identity payload; underflow => incomplete (never read past end) */
+	if (reclen < fixedsz + SizeOfHeapHeader)
+		return WEB_IDENTITY_INCOMPLETE;
+	payload = data + fixedsz;
+	paylen = reclen - fixedsz;
+	datalen = (int) paylen - (int) SizeOfHeapHeader;
+	if (datalen < 0 || (Size) datalen > MaxHeapTupleSize)
+		return WEB_IDENTITY_INCOMPLETE;
+
+	/* mirror DecodeXLogTuple read-only into the aligned local buffer */
+	memcpy(&xlhdr, payload, SizeOfHeapHeader);
+	memset(htup, 0, SizeofHeapTupleHeader);
+	memcpy((char *) htup + SizeofHeapTupleHeader,
+		   payload + SizeOfHeapHeader, datalen);
+	htup->t_infomask = xlhdr.t_infomask;
+	htup->t_infomask2 = xlhdr.t_infomask2;
+	htup->t_hoff = xlhdr.t_hoff;
+	/* reconstructed total length (header + body) */
+	{
+		uint32		t_len = (uint32) datalen + (uint32) SizeofHeapTupleHeader;
+
+		/* header layout must fit inside the reconstructed tuple */
+		if (htup->t_hoff < SizeofHeapTupleHeader || htup->t_hoff > t_len)
+			return WEB_IDENTITY_INCOMPLETE;
+		bodylen = (long) t_len - (long) htup->t_hoff;
+	}
+
+	natts = HeapTupleHeaderGetNatts(htup);
+	hasnulls = (htup->t_infomask & HEAP_HASNULL) != 0;
+	bp = htup->t_bits;
+	tp = (char *) htup + htup->t_hoff;
+
+	/*
+	 * Single read-only deform pass mirroring we_batch_row()'s offset walk, but
+	 * validating (not scattering): for every reached, non-null column we bound
+	 * each datum inside bodylen before measuring it, flag external TOAST in
+	 * identity material, and (for OLD_KEY) confirm each identity attnum is
+	 * present and non-null.  Any underflow fails closed identity_incomplete.
+	 */
+	for (i = 0; i < d->ncols && i < natts; i++)
+	{
+		MineCol    *c = &d->cols[i];
+		bool		isnull = (hasnulls && att_isnull(i, bp));
+		bool		is_key = key_required ? we_ident_is_key_att(id, c->attnum)
+										  : !c->attisdropped;
+		Size		rawlen;
+
+		if (isnull)
+		{
+			/* an identity column must never be NULL in the logged identity */
+			if (is_key)
+				return WEB_IDENTITY_INCOMPLETE;
+			continue;
+		}
+
+		/* need at least one byte of the datum present before measuring it */
+		if (off >= bodylen)
+			return WEB_IDENTITY_INCOMPLETE;
+
+		if (c->attlen == -1)
+			off = att_align_pointer(off, c->attalign, -1, tp + off);
+		else if (c->attlen != -2)
+			off = att_align_nominal(off, c->attalign);
+		if (off < 0 || off >= bodylen)
+			return WEB_IDENTITY_INCOMPLETE;
+
+		if (c->attlen == -1)
+		{
+			if (VARATT_IS_EXTERNAL(tp + off))
+			{
+				/*
+				 * Upstream forces identity TOAST inline (toast_flatten_tuple in
+				 * ExtractReplicaIdentity), so this should not arise naturally;
+				 * if it ever does, the identity datum is not self-contained ->
+				 * fail closed.  The full external-TOAST-in-identity gate is 2d.
+				 */
+				if (is_key)
+					return WEB_IDENTITY_EXTERNAL_TOAST;
+				rawlen = VARSIZE_ANY(tp + off);
+			}
+			else
+				rawlen = VARSIZE_ANY(tp + off);
+		}
+		else if (c->attlen == -2)
+			rawlen = strnlen(tp + off, (size_t) (bodylen - off)) + 1;
+		else
+			rawlen = (Size) c->attlen;
+
+		/* the measured datum must lie wholly inside the body */
+		if ((long) off + (long) rawlen > bodylen)
+			return WEB_IDENTITY_INCOMPLETE;
+
+		if (key_required && is_key)
+			keyseen++;
+		off += rawlen;
+	}
+
+	/* every declared identity key column must have been reached and validated */
+	if (key_required && keyseen < id->natts)
+		return WEB_IDENTITY_INCOMPLETE;
+
+	/*
+	 * Diagnostic-only value trace (DEBUG2): renders identity-column lengths and,
+	 * for pass-by-value fixed-width keys, the integer value, so a runtime
+	 * (@Teodor) probe can confirm decoded identity EQUALS the real old key.
+	 * This is instrumentation, not a product surface: it is not the machine
+	 * stream, not SQL, and is silent at default log levels.
+	 */
+	if (message_level_is_interesting(DEBUG2))
+	{
+		off = 0;
+		hasnulls = (htup->t_infomask & HEAP_HASNULL) != 0;
+		for (i = 0; i < d->ncols && i < natts; i++)
+		{
+			MineCol    *c = &d->cols[i];
+			bool		isnull = (hasnulls && att_isnull(i, bp));
+			bool		is_key = key_required ? we_ident_is_key_att(id, c->attnum)
+											  : !c->attisdropped;
+			Size		rawlen;
+			long		ival = 0;
+			bool		haveival = false;
+
+			if (isnull)
+			{
+				if (is_key)
+					elog(DEBUG2, "walextract 2b decode: relfile=%u att=%d KEY=NULL",
+						 relfile, c->attnum);
+				continue;
+			}
+			if (off >= bodylen)
+				break;
+			if (c->attlen == -1)
+				off = att_align_pointer(off, c->attalign, -1, tp + off);
+			else if (c->attlen != -2)
+				off = att_align_nominal(off, c->attalign);
+			if (off < 0 || off >= bodylen)
+				break;
+			if (c->attlen == -1)
+				rawlen = VARSIZE_ANY(tp + off);
+			else if (c->attlen == -2)
+				rawlen = strnlen(tp + off, (size_t) (bodylen - off)) + 1;
+			else
+			{
+				rawlen = (Size) c->attlen;
+				if (c->attbyval && (rawlen == 2 || rawlen == 4 || rawlen == 8))
+				{
+					haveival = true;
+					if (rawlen == 2)
+						ival = (long) *((int16 *) (tp + off));
+					else if (rawlen == 4)
+						ival = (long) *((int32 *) (tp + off));
+					else
+						ival = (long) *((int64 *) (tp + off));
+				}
+			}
+			if ((long) off + (long) rawlen > bodylen)
+				break;
+			if (is_key)
+			{
+				if (haveival)
+					elog(DEBUG2, "walextract 2b decode: relfile=%u att=%d %s len=%zu val=%ld",
+						 relfile, c->attnum, key_required ? "KEY" : "FULL", rawlen, ival);
+				else
+					elog(DEBUG2, "walextract 2b decode: relfile=%u att=%d %s len=%zu",
+						 relfile, c->attnum, key_required ? "KEY" : "FULL", rawlen);
+			}
+			off += rawlen;
+		}
+	}
+
+	return WEB_DECODED_IDENTITY_READY;
+}
+
 /* ===================== record dispatch ===================== */
 
 void
@@ -2869,11 +3126,28 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		size_t		pos = 0;
 		bool		catalog_trunc = false;
 
-		/* batch mode: user UPDATE is not representable as a ChangeBatch -> fail closed */
-		if (ctx->batch_emit_cb &&
-			we_batch_user_dml_blocked(ctx, rloc.relNumber,
-									 we_classify_update(ctx, rloc.relNumber, xlrec->flags, op)))
-			return;
+		/*
+		 * Machine path: classify the record's identity; when explicit old
+		 * identity is present and the per-relation gate permits
+		 * (dml_emit_pending), run the 2b read-only decode to refine the reason
+		 * to decoded_identity_ready or a fail-closed decode reason.  Emission is
+		 * still 2c, so any reason here fails the batch closed (no ChangeDmlBatch
+		 * yet).  OLD_TUPLE takes precedence over OLD_KEY (full vs key identity),
+		 * mirroring we_classify_update().
+		 */
+		if (ctx->batch_emit_cb)
+		{
+			const char *reason = we_classify_update(ctx, rloc.relNumber,
+													xlrec->flags, op);
+
+			if (strcmp(reason, WEB_DML_EMIT_PENDING) == 0 &&
+				we_rel_trust(ctx, rloc.relNumber) == WX_REL_USER)
+				reason = we_decode_old_identity(ctx, record, rloc.relNumber,
+												false,
+												(xlrec->flags & XLH_UPDATE_CONTAINS_OLD_TUPLE) == 0);
+			if (we_batch_user_dml_blocked(ctx, rloc.relNumber, reason))
+				return;
+		}
 
 		if (!mine_is_catalog(ctx, rloc.relNumber))
 			return;				/* user UPDATE not implemented (by design) */
@@ -2985,11 +3259,24 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		xl_heap_delete *xlrec = (xl_heap_delete *) XLogRecGetData(record);
 		MineDictEnt *e;
 
-		/* batch mode: user DELETE is not representable as a ChangeBatch -> fail closed */
-		if (ctx->batch_emit_cb &&
-			we_batch_user_dml_blocked(ctx, rloc.relNumber,
-									 we_classify_delete(ctx, rloc.relNumber, xlrec->flags)))
-			return;
+		/*
+		 * Machine path: classify identity; on dml_emit_pending for a trusted
+		 * USER relation, run the 2b read-only decode (OLD_TUPLE precedence over
+		 * OLD_KEY).  Still no emission -- any reason fails the batch closed.
+		 */
+		if (ctx->batch_emit_cb)
+		{
+			const char *reason = we_classify_delete(ctx, rloc.relNumber,
+													xlrec->flags);
+
+			if (strcmp(reason, WEB_DML_EMIT_PENDING) == 0 &&
+				we_rel_trust(ctx, rloc.relNumber) == WX_REL_USER)
+				reason = we_decode_old_identity(ctx, record, rloc.relNumber,
+												true,
+												(xlrec->flags & XLH_DELETE_CONTAINS_OLD_TUPLE) == 0);
+			if (we_batch_user_dml_blocked(ctx, rloc.relNumber, reason))
+				return;
+		}
 
 		if (!mine_is_catalog(ctx, rloc.relNumber))
 			return;				/* user DELETE not implemented (by design) */
