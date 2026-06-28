@@ -203,6 +203,7 @@ struct WalExtractContext
 	struct WeXidPoison *poison_tail;
 	bool		committed_poison;	/* a poisoned family reached COMMIT in range */
 	const char *committed_poison_reason;	/* first such family's poison reason */
+	int64		committed_poison_count;		/* number of poisoned families omitted */
 };
 
 /* ===================== small helpers ===================== */
@@ -3536,6 +3537,7 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 				we_discard_batches(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
 				we_discard_accums(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
 				we_discard_dml(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
+				ctx->committed_poison_count++;	/* 2f: per-family omission count */
 				if (!ctx->committed_poison)
 				{
 					ctx->committed_poison = true;
@@ -4276,4 +4278,10 @@ walextract_poison_reason(const WalExtractContext *ctx)
 	return ctx->committed_poison_reason
 		? ctx->committed_poison_reason
 		: WEB_XID_FAMILY_POISONED;
+}
+
+int64
+walextract_poison_count(const WalExtractContext *ctx)
+{
+	return ctx->committed_poison_count;
 }

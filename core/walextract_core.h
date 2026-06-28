@@ -329,5 +329,6 @@ extern const char *walextract_status_message(const WalExtractContext *ctx);
  */
 extern bool walextract_committed_poison(const WalExtractContext *ctx);
 extern const char *walextract_poison_reason(const WalExtractContext *ctx);
+extern int64 walextract_poison_count(const WalExtractContext *ctx);
 
 #endif							/* WALEXTRACT_CORE_H */

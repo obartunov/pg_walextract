@@ -663,13 +663,17 @@ scan_batches(XLogRecPtr start_lsn, XLogRecPtr end_lsn, BatchSinkCtx *bs,
 	if (!bs->detail && walextract_committed_poison(wectx))
 	{
 		const char *msg = walextract_poison_reason(wectx);
+		int64		npoison = walextract_poison_count(wectx);
 
 		pfree(xlogreader->private_data);
 		XLogReaderFree(xlogreader);
 		walextract_context_free(wectx);
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("walextract batch mode stopped: %s", msg)));
+				 errmsg("walextract batch mode stopped: %s", msg),
+				 errdetail("%ld poisoned xid %s omitted from this range",
+						   (long) npoison,
+						   npoison == 1 ? "family" : "families")));
 	}
 
 	*ev_peak = (int64) walextract_buf_peak(wectx);
@@ -1091,13 +1095,17 @@ scan_dmlbatches(XLogRecPtr start_lsn, XLogRecPtr end_lsn, DmlBatchSinkCtx *ds,
 	if (!ds->detail && walextract_committed_poison(wectx))
 	{
 		const char *msg = walextract_poison_reason(wectx);
+		int64		npoison = walextract_poison_count(wectx);
 
 		pfree(xlogreader->private_data);
 		XLogReaderFree(xlogreader);
 		walextract_context_free(wectx);
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("walextract dmlbatch mode stopped: %s", msg)));
+				 errmsg("walextract dmlbatch mode stopped: %s", msg),
+				 errdetail("%ld poisoned xid %s omitted from this range",
+						   (long) npoison,
+						   npoison == 1 ? "family" : "families")));
 	}
 
 	*b_peak = (int64) walextract_bbuf_peak(wectx);
