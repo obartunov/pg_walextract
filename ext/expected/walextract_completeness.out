@@ -1,0 +1,52 @@
+-- 2f apply-stream completeness contract.  The detail SRF omits poisoned xid
+-- families and returns clean ones, so it is NOT a complete apply stream on its
+-- own.  A machine consumer pairs it with the strict stats SRF, which is the
+-- completeness gate: it succeeds iff the range is a complete clean apply stream
+-- and fails closed otherwise, carrying the precise reason and the count of
+-- omitted poisoned families in errdetail.  This lets a consumer distinguish a
+-- complete clean range from a range with omitted poisoned families.
+CREATE EXTENSION walextract;
+CREATE FUNCTION gate(s pg_lsn, e pg_lsn)
+RETURNS TABLE(clean_batches bigint, gate_ok boolean, omitted text) AS $$
+DECLARE d text;
+BEGIN
+    clean_batches := (SELECT count(*) FROM walextract_wal2batch(s, e, true, ''));
+    BEGIN
+        PERFORM n_batches FROM walextract_batch_stats(s, e, true, '');
+        gate_ok := true;
+        omitted := NULL;
+    EXCEPTION WHEN OTHERS THEN
+        GET STACKED DIAGNOSTICS d = PG_EXCEPTION_DETAIL;
+        gate_ok := false;
+        omitted := d;
+    END;
+    RETURN NEXT;
+END$$ LANGUAGE plpgsql;
+CREATE TABLE c(id int primary key, v int);
+INSERT INTO c VALUES (1,1),(2,2);
+-- complete clean range: inserts only, no poison -> gate passes, detail complete
+SELECT pg_current_wal_lsn() AS s \gset
+INSERT INTO c VALUES (3,3),(4,4);
+SELECT pg_current_wal_lsn() AS e \gset
+SELECT 'clean range' AS t, * FROM gate(:'s', :'e');
+      t      | clean_batches | gate_ok | omitted 
+-------------+---------------+---------+---------
+ clean range |             1 | t       | 
+(1 row)
+
+-- range with omitted poisoned families: two poisoned xids + one clean xid ->
+-- gate fails closed; errdetail reports exactly 2 families omitted; the detail
+-- SRF still returns the 1 clean batch (which alone would look "complete").
+SELECT pg_current_wal_lsn() AS s \gset
+BEGIN; INSERT INTO c VALUES (5,5); UPDATE c SET v = v + 1 WHERE id = 1; COMMIT;
+BEGIN; INSERT INTO c VALUES (6,6); UPDATE c SET v = v + 1 WHERE id = 2; COMMIT;
+INSERT INTO c VALUES (7,7);
+SELECT pg_current_wal_lsn() AS e \gset
+SELECT 'poisoned range' AS t, * FROM gate(:'s', :'e');
+       t        | clean_batches | gate_ok |                     omitted                     
+----------------+---------------+---------+-------------------------------------------------
+ poisoned range |             1 | f       | 2 poisoned xid families omitted from this range
+(1 row)
+
+DROP FUNCTION gate(pg_lsn, pg_lsn);
+DROP EXTENSION walextract;
