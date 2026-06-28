@@ -2736,11 +2736,27 @@ we_decode_old_identity(WalExtractContext *ctx, XLogReaderState *record,
 		return WEB_IDENTITY_INCOMPLETE;
 
 	/*
-	 * Diagnostic-only value trace (DEBUG2): renders identity-column lengths and,
-	 * for pass-by-value fixed-width keys, the integer value, so a runtime
-	 * (@Teodor) probe can confirm decoded identity EQUALS the real old key.
-	 * This is instrumentation, not a product surface: it is not the machine
-	 * stream, not SQL, and is silent at default log levels.
+	 * Default diagnostic (DEBUG2): NON-SENSITIVE decode facts only -- relation,
+	 * identity source, and a shape count.  Decoded old keys / old tuples are
+	 * user data and must NEVER be logged by a default build.  The value-level
+	 * trace used for @Teodor value-equality probes is developer-only and is
+	 * compiled out unless the tree is built -DWALEXTRACT_DEBUG_IDENTITY_VALUES.
+	 */
+	elog(DEBUG2,
+		 "walextract 2b decode: relfile=%u source=%s %s=%d reason=%s",
+		 relfile,
+		 key_required ? "OLD_KEY" : "OLD_TUPLE",
+		 key_required ? "keys" : "cols",
+		 key_required ? (int) id->natts : natts,
+		 WEB_DECODED_IDENTITY_READY);
+
+#ifdef WALEXTRACT_DEBUG_IDENTITY_VALUES
+	/*
+	 * DEVELOPER-ONLY identity value trace (not compiled by default).  Renders
+	 * decoded identity-column lengths and, for pass-by-value fixed-width
+	 * columns, the integer value, so a runtime (@Teodor) probe can confirm
+	 * decoded identity EQUALS the real old key.  Off by default precisely
+	 * because these are user values; enable only in a developer build.
 	 */
 	if (message_level_is_interesting(DEBUG2))
 	{
@@ -2759,7 +2775,7 @@ we_decode_old_identity(WalExtractContext *ctx, XLogReaderState *record,
 			if (isnull)
 			{
 				if (is_key)
-					elog(DEBUG2, "walextract 2b decode: relfile=%u att=%d KEY=NULL",
+					elog(DEBUG2, "walextract 2b decode val: relfile=%u att=%d KEY=NULL",
 						 relfile, c->attnum);
 				continue;
 			}
@@ -2794,15 +2810,16 @@ we_decode_old_identity(WalExtractContext *ctx, XLogReaderState *record,
 			if (is_key)
 			{
 				if (haveival)
-					elog(DEBUG2, "walextract 2b decode: relfile=%u att=%d %s len=%zu val=%ld",
+					elog(DEBUG2, "walextract 2b decode val: relfile=%u att=%d %s len=%zu val=%ld",
 						 relfile, c->attnum, key_required ? "KEY" : "FULL", rawlen, ival);
 				else
-					elog(DEBUG2, "walextract 2b decode: relfile=%u att=%d %s len=%zu",
+					elog(DEBUG2, "walextract 2b decode val: relfile=%u att=%d %s len=%zu",
 						 relfile, c->attnum, key_required ? "KEY" : "FULL", rawlen);
 			}
 			off += rawlen;
 		}
 	}
+#endif							/* WALEXTRACT_DEBUG_IDENTITY_VALUES */
 
 	return WEB_DECODED_IDENTITY_READY;
 }
