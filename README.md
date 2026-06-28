@@ -11,6 +11,36 @@ This is a **physical WAL miner foundation**, not a logical-decoding replacement.
     catalog tuple  != original DDL
     op_text        != source of truth
 
+## Machine stream (Update/Delete Identity v0)
+
+`pg_walextract` is **not** a `pg_waldump` text parser. The `pg_waldump` sources
+are used as reference knowledge for record layouts; `walextract` owns the
+structured machine stream and its explicit safety rules.
+
+Three machine modes share one read-only WAL scan:
+
+- **EVENT** — diagnostic / legacy / forensic per-record view (`walextract_wal2sql`,
+  `walextract_wal2event_count`); not a complete apply stream by itself.
+- **BATCH** — INSERT/COPY `ChangeBatch` (`walextract_wal2batch`,
+  `walextract_batch_stats`); xid-buffered, COMMIT-flushed, ABORT-discarded.
+- **DMLBATCH** — UPDATE/DELETE `ChangeDmlBatch` (`walextract_wal2dmlbatch`,
+  `walextract_dmlbatch_stats`).
+
+Accepted machine stream rules:
+
+- UPDATE/DELETE machine output exists **only** for explicit, decoded, safe old
+  identity; anything else fails closed with a precise reason.
+- A poisoned xid family is **never** emitted as a clean apply-safe transaction.
+- Detail SRFs are content surfaces; they can omit poisoned xid families.
+- Strict stats SRFs are the **completeness gate**: a range is a complete clean
+  apply stream only if the matching strict stats SRF succeeds.
+
+Full rules — machine modes, `ChangeBatch`/`ChangeDmlBatch`, explicit
+old-identity, WX_SIDECAR 2 identity metadata, live-prime vs sidecar-v2 parity,
+the completeness gate, xid-family poison, the supported / fail-closed matrices,
+and frozen non-goals — are in
+[docs/machine_stream_semantics.md](docs/machine_stream_semantics.md).
+
 ## 1. Output model: ChangeEvent with structured payload
 
 The core's primary output is a structured `ChangeEvent` (`core/walextract_core.h`).
@@ -148,7 +178,10 @@ from PUBLIC and grants it to `pg_read_server_files`.
   delivered events but emits no framed, atomic per-transaction output; it is not
   an apply source until a framed output format exists.
 - DDL is reported as a catalog effect, not reconstructed original SQL.
-- UPDATE/DELETE of user tables are not decoded (catalog UPDATE/DELETE only).
+- UPDATE/DELETE of user tables are decoded as a structured machine stream in
+  DMLBATCH mode under the explicit old-identity rules (see
+  [docs/machine_stream_semantics.md](docs/machine_stream_semantics.md)); the
+  EVENT/`wal2sql` view still reports only catalog UPDATE/DELETE.
 - TOAST values are not reassembled; toasted columns are marked, not recovered.
 - No rewrite tracking: after VACUUM FULL/CLUSTER/ALTER the relfilenode moves and
   later DML decodes as `dictionary_missing` until the new mapping is seen.
