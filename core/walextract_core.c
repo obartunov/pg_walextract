@@ -2647,7 +2647,21 @@ we_decode_old_identity(WalExtractContext *ctx, XLogReaderState *record,
 	if (d->invalid)
 		return WEB_DESCRIPTOR_INVALIDATED;
 
-	/* locate old-identity payload; underflow => incomplete (never read past end) */
+	/*
+	 * Locate old-identity payload; underflow => incomplete (never read past end).
+	 *
+	 * 2d note: the (Size) datalen > MaxHeapTupleSize arm is the NATURALLY
+	 * REACHABLE identity_incomplete guard.  For REPLICA IDENTITY FULL,
+	 * ExtractReplicaIdentity() inlines any external-TOAST columns into the
+	 * logged old tuple (toast_flatten_tuple, heapam.c), so a row holding a large
+	 * detoasted value produces a flattened old tuple that can exceed
+	 * MaxHeapTupleSize -- larger than this bounded, page-sized reconstruction
+	 * buffer.  We reject it here, BEFORE the memcpy below, so there is no
+	 * overread; the identity is simply not safely capturable by the bounded
+	 * decoder and the stream fails closed.  (Decoding arbitrarily large
+	 * flattened identities would need a dynamically sized buffer -- out of scope;
+	 * see known boundaries.)  The datalen < 0 arm is the payload-underflow case.
+	 */
 	if (reclen < fixedsz + SizeOfHeapHeader)
 		return WEB_IDENTITY_INCOMPLETE;
 	payload = data + fixedsz;
@@ -2715,10 +2729,21 @@ we_decode_old_identity(WalExtractContext *ctx, XLogReaderState *record,
 			if (VARATT_IS_EXTERNAL(tp + off))
 			{
 				/*
-				 * Upstream forces identity TOAST inline (toast_flatten_tuple in
-				 * ExtractReplicaIdentity), so this should not arise naturally;
-				 * if it ever does, the identity datum is not self-contained ->
-				 * fail closed.  The full external-TOAST-in-identity gate is 2d.
+				 * 2d external-TOAST-in-identity gate.  Upstream forces identity
+				 * TOAST inline BEFORE WAL logging: ExtractReplicaIdentity()
+				 * (heapam.c) calls toast_flatten_tuple() for REPLICA IDENTITY
+				 * FULL when the old tuple has external columns (PG19beta1
+				 * heapam.c:9097-9108) and again for the built key tuple
+				 * (heapam.c:9149-9162).  So an on-disk TOAST pointer in old
+				 * identity is NOT naturally reachable, confirmed at runtime: a
+				 * FULL row whose live tuple stores an external column decodes
+				 * here with that column INLINE -> decoded_identity_ready, never
+				 * this branch.  For FULL every live column is identity material
+				 * (is_key true), so an external identity datum fails closed; the
+				 * VARSIZE_ANY fall-through below is defensive only (a non-key
+				 * external column, which OLD_KEY NULLs out, cannot occur).
+				 * Forging such a WAL record needs a hand-built record and is
+				 * left to unit-level hardening; the guard stays.
 				 */
 				if (is_key)
 					return WEB_IDENTITY_EXTERNAL_TOAST;
