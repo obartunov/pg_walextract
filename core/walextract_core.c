@@ -191,6 +191,12 @@ struct WalExtractContext
 	struct WeInsertAccum *iacc_tail;
 	const char *batch_unsupported_reason;	/* WEB_* set with WALEXTRACT_FATAL_UNSUPPORTED_BATCH */
 	bool		dict_primed;		/* dictionary seeded from a provider before the scan */
+
+	/* 2c ChangeDmlBatch sink + per-xid UPDATE/DELETE accumulator (separate path) */
+	WalExtractEmitDmlBatch dml_emit_cb;
+	void	   *dml_emit_sink;
+	struct WeDmlAccum *dacc_head;
+	struct WeDmlAccum *dacc_tail;
 };
 
 /* ===================== small helpers ===================== */
@@ -2595,10 +2601,16 @@ we_ident_is_key_att(const MineIdentEnt *id, int16 attnum)
  *   identity_incomplete               - payload underflows the declared layout
  *   tuple_reconstruction_unsupported  - no usable descriptor to deform against
  *   descriptor_invalidated            - descriptor invalidated at a boundary
+ *
+ * When decoded_identity_ready and id_img != NULL, the reconstructed old-identity
+ * tuple image (header + body, t_len bytes, deformable) is copied into id_img and
+ * its length returned via *id_len; 2c buffers it for emission.  id_img is
+ * untouched on any fail-closed path.
  */
 static const char *
 we_decode_old_identity(WalExtractContext *ctx, XLogReaderState *record,
-					   Oid relfile, bool is_delete, bool key_required)
+					   Oid relfile, bool is_delete, bool key_required,
+					   char *id_img, uint32 id_cap, uint32 *id_len)
 {
 	const MineIdentEnt *id = mine_ident_find(ctx, relfile);
 	Oid			relid = mine_relfile_get(ctx, relfile);
@@ -2610,6 +2622,7 @@ we_decode_old_identity(WalExtractContext *ctx, XLogReaderState *record,
 	uint32		paylen;
 	xl_heap_header xlhdr;
 	int			datalen;
+	uint32		t_len = 0;
 	/* aligned reconstruction buffer (mirrors DecodeXLogTuple target storage) */
 	union
 	{
@@ -2652,14 +2665,11 @@ we_decode_old_identity(WalExtractContext *ctx, XLogReaderState *record,
 	htup->t_infomask2 = xlhdr.t_infomask2;
 	htup->t_hoff = xlhdr.t_hoff;
 	/* reconstructed total length (header + body) */
-	{
-		uint32		t_len = (uint32) datalen + (uint32) SizeofHeapTupleHeader;
-
-		/* header layout must fit inside the reconstructed tuple */
-		if (htup->t_hoff < SizeofHeapTupleHeader || htup->t_hoff > t_len)
-			return WEB_IDENTITY_INCOMPLETE;
-		bodylen = (long) t_len - (long) htup->t_hoff;
-	}
+	t_len = (uint32) datalen + (uint32) SizeofHeapTupleHeader;
+	/* header layout must fit inside the reconstructed tuple */
+	if (htup->t_hoff < SizeofHeapTupleHeader || htup->t_hoff > t_len)
+		return WEB_IDENTITY_INCOMPLETE;
+	bodylen = (long) t_len - (long) htup->t_hoff;
 
 	natts = HeapTupleHeaderGetNatts(htup);
 	hasnulls = (htup->t_infomask & HEAP_HASNULL) != 0;
@@ -2821,7 +2831,478 @@ we_decode_old_identity(WalExtractContext *ctx, XLogReaderState *record,
 	}
 #endif							/* WALEXTRACT_DEBUG_IDENTITY_VALUES */
 
+	/* hand the validated, deformable old-identity image to 2c for buffering */
+	if (id_img != NULL && t_len <= id_cap)
+	{
+		memcpy(id_img, (char *) htup, t_len);
+		if (id_len != NULL)
+			*id_len = t_len;
+	}
+	else if (id_img != NULL)
+	{
+		/* caller buffer too small (should not happen: cap == buffer size) */
+		return WEB_IDENTITY_INCOMPLETE;
+	}
+
 	return WEB_DECODED_IDENTITY_READY;
+}
+
+/* ===================== 2c ChangeDmlBatch buffering + emission ===================== */
+
+/*
+ * One buffered UPDATE/DELETE record (the simplest safe batching shape: one
+ * ChangeDmlBatch per record).  Holds the validated, deformable old-identity
+ * image and, for an UPDATE whose post-image was safely reconstructed, the new
+ * tuple image.  Buffered by xid; emitted on COMMIT, discarded on ABORT.
+ */
+typedef struct WeDmlAccum
+{
+	struct WeDmlAccum *next;
+	TransactionId xid;
+	XLogRecPtr	record_lsn;
+	Oid			relfile;
+	Oid			relid;
+	WalChangeOp op;
+	WalDmlIdentitySource source;
+	bool		has_new;
+	bool		toast_external;
+	bool		incomplete;
+	uint32		id_len;			/* identity image bytes (deformable HeapTuple) */
+	uint32		new_len;		/* new-row image bytes (0 if !has_new) */
+	size_t		acct;			/* bytes charged to ctx->bbuf_bytes */
+	char	   *id_img;			/* malloc'd, MAXALIGN'd, deformable */
+	char	   *new_img;		/* malloc'd or NULL */
+} WeDmlAccum;
+
+static void
+we_dacc_node_free(WalExtractContext *ctx, WeDmlAccum *n)
+{
+	ctx->bbuf_bytes -= n->acct;
+	if (n->id_img)
+		free(n->id_img);
+	if (n->new_img)
+		free(n->new_img);
+	free(n);
+}
+
+static void
+we_dacc_free_all(WalExtractContext *ctx)
+{
+	WeDmlAccum *n = ctx->dacc_head;
+
+	while (n != NULL)
+	{
+		WeDmlAccum *next = n->next;
+
+		if (n->id_img)
+			free(n->id_img);
+		if (n->new_img)
+			free(n->new_img);
+		free(n);
+		n = next;
+	}
+	ctx->dacc_head = ctx->dacc_tail = NULL;
+}
+
+/*
+ * Reconstruct an UPDATE post-image (new tuple) into a deformable HeapTuple image
+ * ONLY when it can be done safely and self-containedly, mirroring the catalog
+ * UPDATE reconstruction: the null-bitmap/pad region (hdrregion) always comes
+ * from the record; user data = prefix(old) + record-middle + suffix(old).  The
+ * prefix/suffix come from the OLD tuple, so they are reconstructable only when
+ * the full old tuple is present (OLD_TUPLE / REPLICA IDENTITY FULL).  For an
+ * OLD_KEY record that uses PREFIX/SUFFIX_FROM_OLD we do not have the full old
+ * tuple, so we decline (caller flags the batch incomplete).  Returns true and
+ * fills the out_img, out_len and toast_ext outputs on success; false => no safe
+ * post-image.
+ */
+static bool
+we_reconstruct_update_newrow(XLogReaderState *record, xl_heap_update *xlrec,
+							 const char *old_img, uint32 old_len, bool have_full_old,
+							 char *out_img, uint32 out_cap, uint32 *out_len,
+							 bool *toast_ext)
+{
+	char	   *blk;
+	Size		blklen;
+	char	   *p;
+	char	   *blkend;
+	uint16		prefixlen = 0;
+	uint16		suffixlen = 0;
+	xl_heap_header xlhdr;
+	uint16		hdrregion;
+	Size		middlelen;
+	const char *old_udata = NULL;
+	uint32		old_udatalen = 0;
+	uint32		t_len;
+	uint32		udata_len;
+	char	   *dst;
+
+	*toast_ext = false;
+
+	if (!(xlrec->flags & XLH_UPDATE_CONTAINS_NEW_TUPLE))
+		return false;			/* no new tuple data logged (e.g. FPI-only) */
+	blk = XLogRecGetBlockData(record, 0, &blklen);
+	if (blk == NULL)
+		return false;
+	blkend = blk + blklen;
+	p = blk;
+
+	if (xlrec->flags & XLH_UPDATE_PREFIX_FROM_OLD)
+	{
+		if (p + sizeof(uint16) > blkend)
+			return false;
+		memcpy(&prefixlen, p, sizeof(uint16));
+		p += sizeof(uint16);
+	}
+	if (xlrec->flags & XLH_UPDATE_SUFFIX_FROM_OLD)
+	{
+		if (p + sizeof(uint16) > blkend)
+			return false;
+		memcpy(&suffixlen, p, sizeof(uint16));
+		p += sizeof(uint16);
+	}
+	/* prefix/suffix come from the old tuple: need the full old tuple to use them */
+	if ((prefixlen > 0 || suffixlen > 0) && !have_full_old)
+		return false;
+
+	if (p + SizeOfHeapHeader > blkend)
+		return false;
+	memcpy(&xlhdr, p, SizeOfHeapHeader);
+	p += SizeOfHeapHeader;
+	if (xlhdr.t_hoff < SizeofHeapTupleHeader)
+		return false;
+	hdrregion = xlhdr.t_hoff - SizeofHeapTupleHeader;
+	if (p + hdrregion > blkend)
+		return false;
+	middlelen = (Size) (blkend - (p + hdrregion));	/* record-supplied user bytes */
+
+	if (have_full_old)
+	{
+		const HeapTupleHeader oh = (const HeapTupleHeader) old_img;
+
+		if (old_len < SizeofHeapTupleHeader || oh->t_hoff > old_len ||
+			oh->t_hoff < SizeofHeapTupleHeader)
+			return false;
+		old_udata = old_img + oh->t_hoff;
+		old_udatalen = old_len - oh->t_hoff;
+		if (prefixlen > old_udatalen || suffixlen > old_udatalen ||
+			(uint32) prefixlen + suffixlen > old_udatalen)
+			return false;
+	}
+
+	udata_len = (uint32) prefixlen + (uint32) middlelen + (uint32) suffixlen;
+	t_len = (uint32) xlhdr.t_hoff + udata_len;
+	if (t_len > out_cap)
+		return false;
+
+	/* assemble: header + record hdrregion + prefix(old) + middle(record) + suffix(old) */
+	dst = out_img;
+	memset(dst, 0, SizeofHeapTupleHeader);
+	((HeapTupleHeader) dst)->t_infomask = xlhdr.t_infomask;
+	((HeapTupleHeader) dst)->t_infomask2 = xlhdr.t_infomask2;
+	((HeapTupleHeader) dst)->t_hoff = xlhdr.t_hoff;
+	memcpy(dst + SizeofHeapTupleHeader, p, hdrregion);	/* null bitmap + pad */
+	dst += xlhdr.t_hoff;
+	if (prefixlen > 0)
+	{
+		memcpy(dst, old_udata, prefixlen);
+		dst += prefixlen;
+	}
+	memcpy(dst, p + hdrregion, middlelen);
+	dst += middlelen;
+	if (suffixlen > 0)
+		memcpy(dst, old_udata + old_udatalen - suffixlen, suffixlen);
+
+	*out_len = t_len;
+	if (xlhdr.t_infomask & HEAP_HASEXTERNAL)
+		*toast_ext = true;		/* post-image references on-disk TOAST (not fetched) */
+	return true;
+}
+
+/*
+ * Buffer one decoded UPDATE/DELETE record for COMMIT-time emission.  The
+ * identity image is mandatory (already validated); the new-row image is
+ * optional.  Charges the shared batch budget and fails closed on overflow/OOM.
+ */
+static void
+we_dacc_add(WalExtractContext *ctx, TransactionId xid, XLogRecPtr lsn,
+			Oid relfile, Oid relid, WalChangeOp op, WalDmlIdentitySource source,
+			const char *id_img, uint32 id_len,
+			const char *new_img, uint32 new_len, bool toast_ext, bool incomplete)
+{
+	size_t		acct = sizeof(WeDmlAccum) + id_len + new_len;
+	WeDmlAccum *n;
+
+	if (ctx->bbuf_bytes + acct > (Size) WALEXTRACT_MAX_BUFFERED_BYTES)
+	{
+		ctx->status = WALEXTRACT_FATAL_BUFFER_OVERFLOW;
+		return;
+	}
+	n = (WeDmlAccum *) malloc(sizeof(WeDmlAccum));
+	if (n == NULL)
+	{
+		ctx->status = WALEXTRACT_FATAL_OOM;
+		return;
+	}
+	memset(n, 0, sizeof(*n));
+	n->id_img = (char *) malloc(id_len);
+	if (n->id_img == NULL)
+	{
+		free(n);
+		ctx->status = WALEXTRACT_FATAL_OOM;
+		return;
+	}
+	memcpy(n->id_img, id_img, id_len);
+	if (new_img != NULL && new_len > 0)
+	{
+		n->new_img = (char *) malloc(new_len);
+		if (n->new_img == NULL)
+		{
+			free(n->id_img);
+			free(n);
+			ctx->status = WALEXTRACT_FATAL_OOM;
+			return;
+		}
+		memcpy(n->new_img, new_img, new_len);
+		n->new_len = new_len;
+		n->has_new = true;
+	}
+	n->xid = xid;
+	n->record_lsn = lsn;
+	n->relfile = relfile;
+	n->relid = relid;
+	n->op = op;
+	n->source = source;
+	n->id_len = id_len;
+	n->toast_external = toast_ext;
+	n->incomplete = incomplete;
+	n->acct = acct;
+
+	if (ctx->dacc_tail == NULL)
+		ctx->dacc_head = ctx->dacc_tail = n;
+	else
+	{
+		ctx->dacc_tail->next = n;
+		ctx->dacc_tail = n;
+	}
+	ctx->bbuf_bytes += acct;
+	if (ctx->bbuf_bytes > ctx->bbuf_bytes_peak)
+		ctx->bbuf_bytes_peak = ctx->bbuf_bytes;
+}
+
+/* build one ChangeDmlBatch from a buffered node and deliver it (transient bbs) */
+static void
+we_dml_build_emit(WalExtractContext *ctx, WeDmlAccum *n, XLogRecPtr commit_lsn)
+{
+	MineRelDesc *d = mine_desc_get(ctx, n->relid, false);
+	WeBufBatch *bid;
+	WeBufBatch *bnew = NULL;
+	ChangeDmlBatch b;
+
+	/* delivery-time trust/descriptor re-check: never stale-decode */
+	if (we_rel_trust(ctx, n->relfile) != WX_REL_USER || d == NULL || d->invalid)
+	{
+		we_batch_unsupported(ctx, WEB_UNKNOWN_DICTIONARY);
+		return;
+	}
+
+	bid = we_batch_begin(ctx, n->relid, n->relfile, d, 1, n->id_len);
+	if (bid == NULL)
+		return;					/* fail closed: overflow/OOM status set */
+	we_batch_row(bid, d, 0, (HeapTupleHeader) n->id_img);
+
+	if (n->has_new)
+	{
+		bnew = we_batch_begin(ctx, n->relid, n->relfile, d, 1, n->new_len);
+		if (bnew == NULL)
+		{
+			free(bid);
+			return;
+		}
+		we_batch_row(bnew, d, 0, (HeapTupleHeader) n->new_img);
+	}
+
+	memset(&b, 0, sizeof(b));
+	b.record_lsn = n->record_lsn;
+	b.commit_lsn = commit_lsn;
+	b.xid = n->xid;
+	b.db_oid = ctx->bound_db;
+	b.rel_oid = n->relid;
+	b.relfilenode = n->relfile;
+	b.op = n->op;
+	b.identity_source = n->source;
+	b.nident = bid->b.ncols;
+	b.ident = bid->b.cols;
+	b.has_new_row = n->has_new;
+	b.nnew = bnew ? bnew->b.ncols : 0;
+	b.newrow = bnew ? bnew->b.cols : NULL;
+	b.toast_external = n->toast_external || bid->b.has_external_toast ||
+		(bnew && bnew->b.has_external_toast);
+	b.incomplete = n->incomplete;
+
+	if (ctx->dml_emit_cb)
+		ctx->dml_emit_cb(&b, ctx->dml_emit_sink);
+
+	free(bid);
+	if (bnew)
+		free(bnew);
+}
+
+/* COMMIT: deliver family DML batches (unless relfilenode dropped same-tx), drop */
+static void
+we_flush_dml(WalExtractContext *ctx, TransactionId topxid,
+			 const TransactionId *subxacts, int nsub, XLogRecPtr commit_lsn,
+			 const xl_xact_parsed_commit *parsed)
+{
+	WeDmlAccum *n = ctx->dacc_head;
+	WeDmlAccum *prev = NULL;
+
+	while (n != NULL)
+	{
+		WeDmlAccum *next = n->next;
+
+		if (we_xid_in_family(n->xid, topxid, subxacts, nsub))
+		{
+			if (!we_commit_drops_relfile(ctx, parsed, n->relfile))
+				we_dml_build_emit(ctx, n, commit_lsn);
+			if (prev == NULL)
+				ctx->dacc_head = next;
+			else
+				prev->next = next;
+			if (ctx->dacc_tail == n)
+				ctx->dacc_tail = prev;
+			we_dacc_node_free(ctx, n);
+		}
+		else
+			prev = n;
+		n = next;
+	}
+}
+
+/* ABORT: drop family DML batches without delivery */
+static void
+we_discard_dml(WalExtractContext *ctx, TransactionId topxid,
+			   const TransactionId *subxacts, int nsub)
+{
+	WeDmlAccum *n = ctx->dacc_head;
+	WeDmlAccum *prev = NULL;
+
+	while (n != NULL)
+	{
+		WeDmlAccum *next = n->next;
+
+		if (we_xid_in_family(n->xid, topxid, subxacts, nsub))
+		{
+			if (prev == NULL)
+				ctx->dacc_head = next;
+			else
+				prev->next = next;
+			if (ctx->dacc_tail == n)
+				ctx->dacc_tail = prev;
+			we_dacc_node_free(ctx, n);
+		}
+		else
+			prev = n;
+		n = next;
+	}
+}
+
+/*
+ * DML-batch mode entry for a user UPDATE/DELETE: classify, and on
+ * decoded_identity_ready buffer the identity (+ safe post-image) for COMMIT-time
+ * emission.  Any other outcome fails the stream closed (no partial DML).
+ * Returns true if the record was handled here (mode active), false otherwise.
+ */
+static bool
+we_dmlbatch_user(WalExtractContext *ctx, XLogReaderState *record, Oid relfile,
+				 bool is_delete, xl_heap_update *up, xl_heap_delete *del)
+{
+	const char *reason;
+	uint8		flags = is_delete ? del->flags : up->flags;
+	bool		key_required;
+	union
+	{
+		double		force_align;
+		char		bytes[SizeofHeapTupleHeader + MaxHeapTupleSize];
+	}			idbuf;
+	uint32		id_len = 0;
+	Oid			relid;
+	WalDmlIdentitySource source;
+
+	if (ctx->dml_emit_cb == NULL)
+		return false;
+
+	/* relfilenode trust gate first (UNKNOWN/CATALOG/INTERNAL never user DML) */
+	switch (we_rel_trust(ctx, relfile))
+	{
+		case WX_REL_UNKNOWN:
+			we_batch_unsupported(ctx, WEB_UNKNOWN_DICTIONARY);
+			return true;
+		case WX_REL_INTERNAL:
+		case WX_REL_CATALOG:
+			return false;		/* not user DML: caller continues (catalog learns) */
+		case WX_REL_USER:
+			break;
+	}
+
+	key_required = is_delete
+		? ((flags & XLH_DELETE_CONTAINS_OLD_TUPLE) == 0)
+		: ((flags & XLH_UPDATE_CONTAINS_OLD_TUPLE) == 0);
+
+	reason = is_delete ? we_classify_delete(ctx, relfile, flags)
+		: we_classify_update(ctx, relfile, flags, XLOG_HEAP_OPMASK & XLogRecGetInfo(record));
+
+	if (strcmp(reason, WEB_DML_EMIT_PENDING) != 0)
+	{
+		we_batch_unsupported(ctx, reason);	/* fail closed: not emit-eligible */
+		return true;
+	}
+
+	/* decode + validate, capturing the deformable old-identity image */
+	reason = we_decode_old_identity(ctx, record, relfile, is_delete, key_required,
+									idbuf.bytes, sizeof(idbuf.bytes), &id_len);
+	if (strcmp(reason, WEB_DECODED_IDENTITY_READY) != 0)
+	{
+		we_batch_unsupported(ctx, reason);
+		return true;
+	}
+
+	relid = mine_relfile_get(ctx, relfile);
+	source = key_required ? WX_DML_OLD_KEY : WX_DML_OLD_TUPLE;
+
+	if (is_delete)
+	{
+		we_dacc_add(ctx, ctx->cur_xid, ctx->cur_lsn, relfile, relid,
+					WCO_DELETE, source, idbuf.bytes, id_len,
+					NULL, 0, false, false);
+	}
+	else
+	{
+		union
+		{
+			double		force_align;
+			char		bytes[SizeofHeapTupleHeader + MaxHeapTupleSize];
+		}			nbuf;
+		uint32		new_len = 0;
+		bool		toast_ext = false;
+		bool		have_full_old = (source == WX_DML_OLD_TUPLE);
+		bool		got_new;
+
+		got_new = we_reconstruct_update_newrow(record, up, idbuf.bytes, id_len,
+											   have_full_old, nbuf.bytes,
+											   sizeof(nbuf.bytes), &new_len,
+											   &toast_ext);
+		/*
+		 * No safe post-image (OLD_KEY with prefix/suffix-from-old, FPI-only,
+		 * etc.): emit the identity but flag the batch incomplete so a consumer
+		 * never applies an UPDATE without its new row.
+		 */
+		we_dacc_add(ctx, ctx->cur_xid, ctx->cur_lsn, relfile, relid,
+					WCO_UPDATE, source, idbuf.bytes, id_len,
+					got_new ? nbuf.bytes : NULL, got_new ? new_len : 0,
+					toast_ext, !got_new);
+	}
+	return true;
 }
 
 /* ===================== record dispatch ===================== */
@@ -2839,8 +3320,10 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 	if (ctx->status != WALEXTRACT_OK)
 		return;					/* failed closed: stop processing */
 
-	/* single-active mode invariant: event XOR batch, never a tee (see header) */
+	/* single-active mode invariant: at most one of event/batch/dmlbatch sinks */
 	Assert(!(ctx->emit_cb && ctx->batch_emit_cb));
+	Assert(!(ctx->emit_cb && ctx->dml_emit_cb));
+	Assert(!(ctx->batch_emit_cb && ctx->dml_emit_cb));
 
 	/*
 	 * Transaction boundary: a COMMIT delivers the transaction's buffered
@@ -2874,6 +3357,8 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 							 record->ReadRecPtr, &parsed);
 			we_flush_accums(ctx, topxid, parsed.subxacts, parsed.nsubxacts,
 							 record->ReadRecPtr, &parsed);
+			we_flush_dml(ctx, topxid, parsed.subxacts, parsed.nsubxacts,
+						 record->ReadRecPtr, &parsed);
 			we_apply_drop_boundaries(ctx, &parsed, record->ReadRecPtr, topxid);
 		}
 		else if (xact_op == XLOG_XACT_ABORT)
@@ -2885,6 +3370,7 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 			we_discard_family(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
 			we_discard_batches(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
 			we_discard_accums(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
+			we_discard_dml(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
 		}
 		else if (xact_op == XLOG_XACT_PREPARE ||
 				 xact_op == XLOG_XACT_COMMIT_PREPARED ||
@@ -2945,6 +3431,28 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		 * INTERNAL/CATALOG fall through to the per-tuple learning path so the
 		 * dictionary keeps mining catalog inserts.
 		 */
+		if (ctx->dml_emit_cb)
+		{
+			WalExtractRelTrust trust = we_rel_trust(ctx, rloc.relNumber);
+
+			if (trust == WX_REL_UNKNOWN)
+			{
+				we_batch_unsupported(ctx, WEB_UNKNOWN_DICTIONARY);
+				return;
+			}
+			if (trust == WX_REL_USER)
+			{
+				/*
+				 * DML-batch mode does not emit inserts; a user INSERT means a
+				 * transaction could mix INSERT with UPDATE/DELETE.  Delivering
+				 * only the DML part would be a partial apply-safe family, so
+				 * fail the stream closed (xid-family poison is 2e).
+				 */
+				we_batch_unsupported(ctx, WEB_DMLBATCH_MIXED_INSERT);
+				return;
+			}
+			/* INTERNAL/CATALOG: fall through to the catalog-learning path */
+		}
 		if (ctx->batch_emit_cb)
 		{
 			WalExtractRelTrust trust = we_rel_trust(ctx, rloc.relNumber);
@@ -3152,7 +3660,13 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		 * yet).  OLD_TUPLE takes precedence over OLD_KEY (full vs key identity),
 		 * mirroring we_classify_update().
 		 */
-		if (ctx->batch_emit_cb)
+		if (ctx->dml_emit_cb)
+		{
+			/* 2c: emit ChangeDmlBatch for decoded_identity_ready, else fail closed */
+			if (we_dmlbatch_user(ctx, record, rloc.relNumber, false, xlrec, NULL))
+				return;
+		}
+		else if (ctx->batch_emit_cb)
 		{
 			const char *reason = we_classify_update(ctx, rloc.relNumber,
 													xlrec->flags, op);
@@ -3161,7 +3675,8 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 				we_rel_trust(ctx, rloc.relNumber) == WX_REL_USER)
 				reason = we_decode_old_identity(ctx, record, rloc.relNumber,
 												false,
-												(xlrec->flags & XLH_UPDATE_CONTAINS_OLD_TUPLE) == 0);
+												(xlrec->flags & XLH_UPDATE_CONTAINS_OLD_TUPLE) == 0,
+												NULL, 0, NULL);
 			if (we_batch_user_dml_blocked(ctx, rloc.relNumber, reason))
 				return;
 		}
@@ -3281,7 +3796,13 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		 * USER relation, run the 2b read-only decode (OLD_TUPLE precedence over
 		 * OLD_KEY).  Still no emission -- any reason fails the batch closed.
 		 */
-		if (ctx->batch_emit_cb)
+		if (ctx->dml_emit_cb)
+		{
+			/* 2c: emit DELETE ChangeDmlBatch for decoded_identity_ready */
+			if (we_dmlbatch_user(ctx, record, rloc.relNumber, true, NULL, xlrec))
+				return;
+		}
+		else if (ctx->batch_emit_cb)
 		{
 			const char *reason = we_classify_delete(ctx, rloc.relNumber,
 													xlrec->flags);
@@ -3290,7 +3811,8 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 				we_rel_trust(ctx, rloc.relNumber) == WX_REL_USER)
 				reason = we_decode_old_identity(ctx, record, rloc.relNumber,
 												true,
-												(xlrec->flags & XLH_DELETE_CONTAINS_OLD_TUPLE) == 0);
+												(xlrec->flags & XLH_DELETE_CONTAINS_OLD_TUPLE) == 0,
+												NULL, 0, NULL);
 			if (we_batch_user_dml_blocked(ctx, rloc.relNumber, reason))
 				return;
 		}
@@ -3346,6 +3868,7 @@ walextract_context_free(WalExtractContext *ctx)
 		we_buf_free_all(ctx);
 		we_bbuf_free_all(ctx);
 		we_iaccum_free_all(ctx);
+		we_dacc_free_all(ctx);
 		free(ctx);
 	}
 }
@@ -3357,6 +3880,8 @@ walextract_context_reset(WalExtractContext *ctx)
 	void	   *sink = ctx->emit_sink;
 	WalExtractEmitBatch bcb = ctx->batch_emit_cb;
 	void	   *bsink = ctx->batch_emit_sink;
+	WalExtractEmitDmlBatch dcb = ctx->dml_emit_cb;
+	void	   *dsink = ctx->dml_emit_sink;
 	bool		boot = ctx->do_bootstrap;
 	Oid			tdb = ctx->target_db;
 	WalExtractRenderMode mode = ctx->render_mode;
@@ -3365,12 +3890,15 @@ walextract_context_reset(WalExtractContext *ctx)
 	we_buf_free_all(ctx);		/* drop any open-transaction buffer first */
 	we_bbuf_free_all(ctx);
 	we_iaccum_free_all(ctx);
+	we_dacc_free_all(ctx);
 	strlcpy(pg, ctx->pgdata, sizeof(pg));
 	memset(ctx, 0, sizeof(*ctx));
 	ctx->emit_cb = cb;
 	ctx->emit_sink = sink;
 	ctx->batch_emit_cb = bcb;
 	ctx->batch_emit_sink = bsink;
+	ctx->dml_emit_cb = dcb;
+	ctx->dml_emit_sink = dsink;
 	ctx->do_bootstrap = boot;
 	ctx->target_db = tdb;
 	ctx->render_mode = mode;
@@ -3382,9 +3910,11 @@ walextract_set_emit(WalExtractContext *ctx, WalExtractEmit cb, void *sink)
 {
 	ctx->emit_cb = cb;
 	ctx->emit_sink = sink;
-	/* single-active mode: installing the event sink disables batch mode */
+	/* single-active mode: installing the event sink disables batch/dmlbatch */
 	ctx->batch_emit_cb = NULL;
 	ctx->batch_emit_sink = NULL;
+	ctx->dml_emit_cb = NULL;
+	ctx->dml_emit_sink = NULL;
 }
 
 Size
@@ -3397,6 +3927,8 @@ WalExtractActiveMode
 walextract_active_mode(const WalExtractContext *ctx)
 {
 	/* single-active mode is enforced by the setters; report the live sink */
+	if (ctx->dml_emit_cb != NULL)
+		return WX_MODE_DMLBATCH;
 	if (ctx->batch_emit_cb != NULL)
 		return WX_MODE_BATCH;
 	if (ctx->emit_cb != NULL)
@@ -3443,9 +3975,23 @@ walextract_set_emit_batch(WalExtractContext *ctx, WalExtractEmitBatch cb, void *
 {
 	ctx->batch_emit_cb = cb;
 	ctx->batch_emit_sink = sink;
-	/* single-active mode: installing the batch sink disables event mode */
+	/* single-active mode: installing the batch sink disables event/dmlbatch */
 	ctx->emit_cb = NULL;
 	ctx->emit_sink = NULL;
+	ctx->dml_emit_cb = NULL;
+	ctx->dml_emit_sink = NULL;
+}
+
+void
+walextract_set_emit_dmlbatch(WalExtractContext *ctx, WalExtractEmitDmlBatch cb, void *sink)
+{
+	ctx->dml_emit_cb = cb;
+	ctx->dml_emit_sink = sink;
+	/* single-active mode: installing the dmlbatch sink disables event/batch */
+	ctx->emit_cb = NULL;
+	ctx->emit_sink = NULL;
+	ctx->batch_emit_cb = NULL;
+	ctx->batch_emit_sink = NULL;
 }
 
 void

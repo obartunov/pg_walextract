@@ -34,6 +34,29 @@ LANGUAGE C STRICT PARALLEL UNSAFE;
 REVOKE EXECUTE ON FUNCTION walextract_batch_stats(pg_lsn, pg_lsn, boolean, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION walextract_batch_stats(pg_lsn, pg_lsn, boolean, text) TO pg_read_server_files;
 
+-- 2c machine UPDATE/DELETE path: typed-shape rows per ChangeDmlBatch (no values)
+CREATE FUNCTION walextract_wal2dmlbatch(start_lsn pg_lsn, end_lsn pg_lsn, prime boolean DEFAULT false, sidecar text DEFAULT '')
+RETURNS TABLE(record_lsn pg_lsn, commit_lsn pg_lsn, xid xid,
+              relfilenode oid, rel_oid oid, op text, identity_source text,
+              nident int, has_new_row boolean, nnew int,
+              toast_external boolean, incomplete boolean)
+AS 'MODULE_PATHNAME', 'walextract_wal2dmlbatch'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+REVOKE EXECUTE ON FUNCTION walextract_wal2dmlbatch(pg_lsn, pg_lsn, boolean, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION walextract_wal2dmlbatch(pg_lsn, pg_lsn, boolean, text) TO pg_read_server_files;
+
+-- 2c machine UPDATE/DELETE single-row summary (counts + flags; fails closed)
+CREATE FUNCTION walextract_dmlbatch_stats(start_lsn pg_lsn, end_lsn pg_lsn, prime boolean DEFAULT false, sidecar text DEFAULT '')
+RETURNS TABLE(n_batches bigint, n_update bigint, n_delete bigint,
+              n_with_new_row bigint, any_toast_external boolean,
+              any_incomplete boolean)
+AS 'MODULE_PATHNAME', 'walextract_dmlbatch_stats'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+REVOKE EXECUTE ON FUNCTION walextract_dmlbatch_stats(pg_lsn, pg_lsn, boolean, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION walextract_dmlbatch_stats(pg_lsn, pg_lsn, boolean, text) TO pg_read_server_files;
+
 -- single-active mode contract selftest (no WAL access; safe for PUBLIC)
 CREATE FUNCTION walextract_mode_selftest()
 RETURNS text

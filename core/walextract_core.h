@@ -87,6 +87,15 @@ typedef enum WalChangeOp
 #define WEB_DESCRIPTOR_INVALIDATED		"descriptor_invalidated"	/* descriptor invalidated
 												 * at a rewrite/drop boundary */
 
+/*
+ * 2c DML-batch mode: a transaction that mixes a user INSERT with UPDATE/DELETE
+ * cannot be delivered as a clean apply-safe family yet (xid-family poison is
+ * 2e), and DML-batch mode does not emit inserts.  Delivering only the DML part
+ * would be a partial apply-safe transaction, so a user INSERT seen in DML-batch
+ * mode fails the stream closed instead.
+ */
+#define WEB_DMLBATCH_MIXED_INSERT		"dmlbatch_mixed_insert_unsupported"
+
 #define WALEXTRACT_MAX_REASONS	6
 #define WALEXTRACT_MAX_COLS		80
 
@@ -172,6 +181,50 @@ typedef struct ChangeBatch
 } ChangeBatch;
 
 /*
+ * 2c ChangeDmlBatch (machine UPDATE/DELETE path).  A SEPARATE typed output from
+ * the insert ChangeBatch -- it is never overloaded onto inserts.  It is emitted
+ * ONLY for a record the explicit-evidence gate proved decoded_identity_ready
+ * (real OLD_KEY/OLD_TUPLE present and validated by the 2b decode); every other
+ * UPDATE/DELETE outcome still fails the stream closed.
+ *
+ * The old identity is delivered as a single columnar row reusing ChangeVector:
+ * for OLD_KEY only the identity-key columns are non-null (ExtractReplicaIdentity
+ * NULLs the rest); for OLD_TUPLE the whole old row is present.  The post-image
+ * (new row) is delivered only for an UPDATE whose new tuple was SAFELY decoded
+ * (full old tuple available, or new tuple self-contained); otherwise has_new_row
+ * is false and incomplete is set -- the consumer must not apply it as-is.
+ *
+ * No SQL text, no rm_desc, no TOAST reassembly/fetch, no page-state, no
+ * ChangeEvent.  An on-disk TOAST pointer is copied verbatim and flagged
+ * toast_external (the batch is then partial).
+ */
+typedef enum WalDmlIdentitySource
+{
+	WX_DML_OLD_KEY = 0,			/* CONTAINS_OLD_KEY: identity = replica-identity key */
+	WX_DML_OLD_TUPLE			/* CONTAINS_OLD_TUPLE: identity = full old row (FULL) */
+} WalDmlIdentitySource;
+
+typedef struct ChangeDmlBatch
+{
+	XLogRecPtr	record_lsn;
+	XLogRecPtr	commit_lsn;		/* set by the assembler at COMMIT */
+	TransactionId xid;
+	Oid			db_oid;
+	Oid			rel_oid;
+	Oid			relfilenode;
+	WalChangeOp op;				/* WCO_UPDATE or WCO_DELETE */
+	WalDmlIdentitySource identity_source;
+	int			nident;			/* identity columns (logical, descriptor order) */
+	ChangeVector *ident;		/* identity vectors, 1 row each, arena-owned */
+	bool		has_new_row;	/* UPDATE post-image present and safely decoded */
+	int			nnew;			/* new-row columns (0 if !has_new_row) */
+	ChangeVector *newrow;		/* new-row vectors, 1 row each (NULL if !has_new_row) */
+	bool		toast_external;	/* an emitted value is an on-disk TOAST pointer */
+	bool		incomplete;		/* a value (typically the UPDATE post-image) is not
+								 * faithfully captured: do NOT apply as-is */
+} ChangeDmlBatch;
+
+/*
  * Transaction-assembler status.  The miner buffers physical ChangeEvents by
  * xid and only emits a transaction's events on its COMMIT record; it must
  * never expose an aborted or still-open transaction as committed.  When the
@@ -200,13 +253,15 @@ typedef enum WalExtractRenderMode
 typedef struct WalExtractContext WalExtractContext;
 typedef void (*WalExtractEmit) (const ChangeEvent *ev, void *sink);
 typedef void (*WalExtractEmitBatch) (const ChangeBatch *b, void *sink);
+typedef void (*WalExtractEmitDmlBatch) (const ChangeDmlBatch *b, void *sink);
 
-/* which output sink is currently active (single-active: never both) */
+/* which output sink is currently active (single-active: never two at once) */
 typedef enum WalExtractActiveMode
 {
 	WX_MODE_NONE = 0,
 	WX_MODE_EVENT,
-	WX_MODE_BATCH
+	WX_MODE_BATCH,
+	WX_MODE_DMLBATCH			/* 2c: ChangeDmlBatch (UPDATE/DELETE) machine path */
 } WalExtractActiveMode;
 
 extern WalExtractContext *walextract_context_create(void);
@@ -221,6 +276,7 @@ extern void walextract_context_reset(WalExtractContext *ctx);
  */
 extern void walextract_set_emit(WalExtractContext *ctx, WalExtractEmit cb, void *sink);
 extern void walextract_set_emit_batch(WalExtractContext *ctx, WalExtractEmitBatch cb, void *sink);
+extern void walextract_set_emit_dmlbatch(WalExtractContext *ctx, WalExtractEmitDmlBatch cb, void *sink);
 extern WalExtractActiveMode walextract_active_mode(const WalExtractContext *ctx);
 
 /*
