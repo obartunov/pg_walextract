@@ -654,6 +654,24 @@ scan_batches(XLogRecPtr start_lsn, XLogRecPtr end_lsn, BatchSinkCtx *bs,
 				 errmsg("walextract batch mode stopped: %s", msg)));
 	}
 
+	/*
+	 * 2e: poison is not a fatal -- clean families have already been emitted and
+	 * poisoned families suppressed.  The strict stats summary (detail = false)
+	 * fails closed with the precise poison reason; the detail SRF (detail =
+	 * true) simply omits poisoned families and returns the clean rows.
+	 */
+	if (!bs->detail && walextract_committed_poison(wectx))
+	{
+		const char *msg = walextract_poison_reason(wectx);
+
+		pfree(xlogreader->private_data);
+		XLogReaderFree(xlogreader);
+		walextract_context_free(wectx);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("walextract batch mode stopped: %s", msg)));
+	}
+
 	*ev_peak = (int64) walextract_buf_peak(wectx);
 	*b_peak = (int64) walextract_bbuf_peak(wectx);
 	pfree(xlogreader->private_data);
@@ -1059,6 +1077,20 @@ scan_dmlbatches(XLogRecPtr start_lsn, XLogRecPtr end_lsn, DmlBatchSinkCtx *ds,
 	if (walextract_failed(wectx))
 	{
 		const char *msg = walextract_status_message(wectx);
+
+		pfree(xlogreader->private_data);
+		XLogReaderFree(xlogreader);
+		walextract_context_free(wectx);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("walextract dmlbatch mode stopped: %s", msg)));
+	}
+
+	/* 2e: strict stats summary fails closed on a committed poisoned family;
+	 * the detail SRF omits poisoned families and returns clean rows. */
+	if (!ds->detail && walextract_committed_poison(wectx))
+	{
+		const char *msg = walextract_poison_reason(wectx);
 
 		pfree(xlogreader->private_data);
 		XLogReaderFree(xlogreader);

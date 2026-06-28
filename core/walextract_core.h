@@ -96,6 +96,14 @@ typedef enum WalChangeOp
  */
 #define WEB_DMLBATCH_MIXED_INSERT		"dmlbatch_mixed_insert_unsupported"
 
+/*
+ * 2e transaction-level poison reasons.  A poisoned family surfaces the precise
+ * operation-level reason that poisoned it (one of the WEB_* above) so the cause
+ * is never collapsed into a generic token; WEB_XID_FAMILY_POISONED is only the
+ * fallback when no op-level reason was recorded.
+ */
+#define WEB_XID_FAMILY_POISONED			"xid_family_poisoned"
+
 #define WALEXTRACT_MAX_REASONS	6
 #define WALEXTRACT_MAX_COLS		80
 
@@ -313,5 +321,13 @@ extern const char *walextract_op_name(WalChangeOp op);
 extern bool walextract_failed(const WalExtractContext *ctx);
 extern WalExtractStatus walextract_status(const WalExtractContext *ctx);
 extern const char *walextract_status_message(const WalExtractContext *ctx);
+
+/*
+ * 2e: a poisoned transaction family reached COMMIT in the scanned range.  This
+ * is NOT a fatal (walextract_failed stays false and clean families still
+ * emit); a strict SRF may use it to fail closed with the precise poison reason.
+ */
+extern bool walextract_committed_poison(const WalExtractContext *ctx);
+extern const char *walextract_poison_reason(const WalExtractContext *ctx);
 
 #endif							/* WALEXTRACT_CORE_H */

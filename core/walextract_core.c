@@ -197,6 +197,12 @@ struct WalExtractContext
 	void	   *dml_emit_sink;
 	struct WeDmlAccum *dacc_head;
 	struct WeDmlAccum *dacc_tail;
+
+	/* 2e xid-family poison: per-xid poison state + committed-poison signal */
+	struct WeXidPoison *poison_head;
+	struct WeXidPoison *poison_tail;
+	bool		committed_poison;	/* a poisoned family reached COMMIT in range */
+	const char *committed_poison_reason;	/* first such family's poison reason */
 };
 
 /* ===================== small helpers ===================== */
@@ -2112,6 +2118,7 @@ we_bbuf_free_all(WalExtractContext *ctx)
 }
 
 static void we_batch_unsupported(WalExtractContext *ctx, const char *reason);
+static void we_poison_xid(WalExtractContext *ctx, const char *reason);
 
 /* ============ single-INSERT accumulator (one ChangeBatch per xid+relfile) ============
  *
@@ -2411,7 +2418,7 @@ we_batch_user_dml_blocked(WalExtractContext *ctx, Oid relfile, const char *op_re
 			we_batch_unsupported(ctx, WEB_UNKNOWN_DICTIONARY);
 			return true;
 		case WX_REL_USER:
-			we_batch_unsupported(ctx, op_reason);
+			we_poison_xid(ctx, op_reason);	/* 2e: poison family, keep scanning */
 			return true;
 		case WX_REL_INTERNAL:
 		case WX_REL_CATALOG:
@@ -3232,6 +3239,143 @@ we_discard_dml(WalExtractContext *ctx, TransactionId topxid,
 	}
 }
 
+/* ===================== 2e xid-family poison ===================== */
+
+/*
+ * Transaction-level poison.  A user operation that is unsupported, unsafe,
+ * incomplete, or identity-unsafe poisons its xid: the WHOLE xid family must not
+ * be emitted as a clean apply-safe machine transaction, even if other records
+ * in the same xid are individually supported.  This is distinct from a genuine
+ * fatal (unknown_dictionary, two-phase, aborted DDL, buffer overflow, OOM),
+ * which still stops the entire scan -- poison only suppresses the offending
+ * family and lets clean families keep flowing.
+ *
+ * Poison-time we immediately discard the offending xid's pending machine
+ * batches; at the family COMMIT we additionally discard anything buffered after
+ * the poison, never flush the family, and raise the committed-poison signal so
+ * the strict stats SRFs can fail closed with the precise reason.  ABORT discards
+ * everything including poison state.
+ */
+typedef struct WeXidPoison
+{
+	struct WeXidPoison *next;
+	TransactionId xid;
+	const char *reason;			/* first precise op-level reason (static string) */
+} WeXidPoison;
+
+static WeXidPoison *
+we_poison_find(WalExtractContext *ctx, TransactionId xid)
+{
+	WeXidPoison *p;
+
+	for (p = ctx->poison_head; p != NULL; p = p->next)
+		if (p->xid == xid)
+			return p;
+	return NULL;
+}
+
+static void
+we_poison_xid(WalExtractContext *ctx, const char *reason)
+{
+	TransactionId xid = ctx->cur_xid;
+	WeXidPoison *p = we_poison_find(ctx, xid);
+
+	if (p == NULL)
+	{
+		p = (WeXidPoison *) malloc(sizeof(WeXidPoison));
+		if (p == NULL)
+		{
+			ctx->status = WALEXTRACT_FATAL_OOM;
+			return;
+		}
+		p->xid = xid;
+		p->reason = reason;		/* first reason wins (static WEB_* string) */
+		p->next = NULL;
+		if (ctx->poison_tail == NULL)
+			ctx->poison_head = ctx->poison_tail = p;
+		else
+		{
+			ctx->poison_tail->next = p;
+			ctx->poison_tail = p;
+		}
+	}
+
+	/* immediately suppress this xid's pending machine batches (all paths) */
+	we_discard_family(ctx, xid, NULL, 0);
+	we_discard_batches(ctx, xid, NULL, 0);
+	we_discard_accums(ctx, xid, NULL, 0);
+	we_discard_dml(ctx, xid, NULL, 0);
+}
+
+/* is any member of the COMMIT/ABORT family poisoned? */
+static bool
+we_poison_family_poisoned(WalExtractContext *ctx, TransactionId topxid,
+						  const TransactionId *subxacts, int nsub)
+{
+	WeXidPoison *p;
+
+	for (p = ctx->poison_head; p != NULL; p = p->next)
+		if (we_xid_in_family(p->xid, topxid, subxacts, nsub))
+			return true;
+	return false;
+}
+
+/* first (WAL-order) poison reason among the family */
+static const char *
+we_poison_family_reason(WalExtractContext *ctx, TransactionId topxid,
+						const TransactionId *subxacts, int nsub)
+{
+	WeXidPoison *p;
+
+	for (p = ctx->poison_head; p != NULL; p = p->next)
+		if (we_xid_in_family(p->xid, topxid, subxacts, nsub))
+			return p->reason;
+	return WEB_XID_FAMILY_POISONED;
+}
+
+/* free poison entries for a settled family (COMMIT or ABORT) */
+static void
+we_poison_discard_family(WalExtractContext *ctx, TransactionId topxid,
+						 const TransactionId *subxacts, int nsub)
+{
+	WeXidPoison *p = ctx->poison_head;
+	WeXidPoison *prev = NULL;
+
+	while (p != NULL)
+	{
+		WeXidPoison *next = p->next;
+
+		if (we_xid_in_family(p->xid, topxid, subxacts, nsub))
+		{
+			if (prev == NULL)
+				ctx->poison_head = next;
+			else
+				prev->next = next;
+			if (ctx->poison_tail == p)
+				ctx->poison_tail = prev;
+			free(p);
+		}
+		else
+			prev = p;
+		p = next;
+	}
+}
+
+static void
+we_poison_free_all(WalExtractContext *ctx)
+{
+	WeXidPoison *p = ctx->poison_head;
+
+	while (p != NULL)
+	{
+		WeXidPoison *next = p->next;
+
+		free(p);
+		p = next;
+	}
+	ctx->poison_head = ctx->poison_tail = NULL;
+}
+
 /*
  * DML-batch mode entry for a user UPDATE/DELETE: classify, and on
  * decoded_identity_ready buffer the identity (+ safe post-image) for COMMIT-time
@@ -3279,7 +3423,7 @@ we_dmlbatch_user(WalExtractContext *ctx, XLogReaderState *record, Oid relfile,
 
 	if (strcmp(reason, WEB_DML_EMIT_PENDING) != 0)
 	{
-		we_batch_unsupported(ctx, reason);	/* fail closed: not emit-eligible */
+		we_poison_xid(ctx, reason);	/* 2e: not emit-eligible -> poison family */
 		return true;
 	}
 
@@ -3288,7 +3432,7 @@ we_dmlbatch_user(WalExtractContext *ctx, XLogReaderState *record, Oid relfile,
 									idbuf.bytes, sizeof(idbuf.bytes), &id_len);
 	if (strcmp(reason, WEB_DECODED_IDENTITY_READY) != 0)
 	{
-		we_batch_unsupported(ctx, reason);
+		we_poison_xid(ctx, reason);	/* 2e: identity unsafe -> poison family */
 		return true;
 	}
 
@@ -3375,15 +3519,42 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 			 * so a same-transaction INSERT+TRUNCATE/DROP is not delivered as an
 			 * apply candidate.  The boundary pass then invalidates the stale
 			 * mapping for future records and emits the explicit boundary event.
+			 *
+			 * 2e: if any member of this family was poisoned, the whole family is
+			 * unsafe -- discard all of its pending machine batches instead of
+			 * flushing (never a partial apply-safe family) and raise the
+			 * committed-poison signal with the precise first poison reason.
 			 */
-			we_flush_family(ctx, topxid, parsed.subxacts, parsed.nsubxacts,
-							record->ReadRecPtr, &parsed);
-			we_flush_batches(ctx, topxid, parsed.subxacts, parsed.nsubxacts,
+			if (we_poison_family_poisoned(ctx, topxid, parsed.subxacts,
+										  parsed.nsubxacts))
+			{
+				const char *r = we_poison_family_reason(ctx, topxid,
+														parsed.subxacts,
+														parsed.nsubxacts);
+
+				we_discard_family(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
+				we_discard_batches(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
+				we_discard_accums(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
+				we_discard_dml(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
+				if (!ctx->committed_poison)
+				{
+					ctx->committed_poison = true;
+					ctx->committed_poison_reason = r;
+				}
+				we_poison_discard_family(ctx, topxid, parsed.subxacts,
+										 parsed.nsubxacts);
+			}
+			else
+			{
+				we_flush_family(ctx, topxid, parsed.subxacts, parsed.nsubxacts,
+								record->ReadRecPtr, &parsed);
+				we_flush_batches(ctx, topxid, parsed.subxacts, parsed.nsubxacts,
+								 record->ReadRecPtr, &parsed);
+				we_flush_accums(ctx, topxid, parsed.subxacts, parsed.nsubxacts,
+								 record->ReadRecPtr, &parsed);
+				we_flush_dml(ctx, topxid, parsed.subxacts, parsed.nsubxacts,
 							 record->ReadRecPtr, &parsed);
-			we_flush_accums(ctx, topxid, parsed.subxacts, parsed.nsubxacts,
-							 record->ReadRecPtr, &parsed);
-			we_flush_dml(ctx, topxid, parsed.subxacts, parsed.nsubxacts,
-						 record->ReadRecPtr, &parsed);
+			}
 			we_apply_drop_boundaries(ctx, &parsed, record->ReadRecPtr, topxid);
 		}
 		else if (xact_op == XLOG_XACT_ABORT)
@@ -3396,6 +3567,8 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 			we_discard_batches(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
 			we_discard_accums(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
 			we_discard_dml(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
+			/* 2e: drop poison state too -> an aborted mixed xid leaks nothing */
+			we_poison_discard_family(ctx, topxid, parsed.subxacts, parsed.nsubxacts);
 		}
 		else if (xact_op == XLOG_XACT_PREPARE ||
 				 xact_op == XLOG_XACT_COMMIT_PREPARED ||
@@ -3468,12 +3641,12 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 			if (trust == WX_REL_USER)
 			{
 				/*
-				 * DML-batch mode does not emit inserts; a user INSERT means a
-				 * transaction could mix INSERT with UPDATE/DELETE.  Delivering
-				 * only the DML part would be a partial apply-safe family, so
-				 * fail the stream closed (xid-family poison is 2e).
+				 * DML-batch mode does not emit inserts; a user INSERT means the
+				 * xid may mix INSERT with UPDATE/DELETE.  2e: poison the family
+				 * so neither part is delivered as a clean apply-safe stream,
+				 * while clean families keep flowing.
 				 */
-				we_batch_unsupported(ctx, WEB_DMLBATCH_MIXED_INSERT);
+				we_poison_xid(ctx, WEB_DMLBATCH_MIXED_INSERT);
 				return;
 			}
 			/* INTERNAL/CATALOG: fall through to the catalog-learning path */
@@ -3894,6 +4067,7 @@ walextract_context_free(WalExtractContext *ctx)
 		we_bbuf_free_all(ctx);
 		we_iaccum_free_all(ctx);
 		we_dacc_free_all(ctx);
+		we_poison_free_all(ctx);
 		free(ctx);
 	}
 }
@@ -3916,6 +4090,7 @@ walextract_context_reset(WalExtractContext *ctx)
 	we_bbuf_free_all(ctx);
 	we_iaccum_free_all(ctx);
 	we_dacc_free_all(ctx);
+	we_poison_free_all(ctx);
 	strlcpy(pg, ctx->pgdata, sizeof(pg));
 	memset(ctx, 0, sizeof(*ctx));
 	ctx->emit_cb = cb;
@@ -4087,4 +4262,18 @@ walextract_status_message(const WalExtractContext *ctx)
 				: "batch mode encountered an unsupported user-DML record";
 	}
 	return "unknown";
+}
+
+bool
+walextract_committed_poison(const WalExtractContext *ctx)
+{
+	return ctx->committed_poison;
+}
+
+const char *
+walextract_poison_reason(const WalExtractContext *ctx)
+{
+	return ctx->committed_poison_reason
+		? ctx->committed_poison_reason
+		: WEB_XID_FAMILY_POISONED;
 }
