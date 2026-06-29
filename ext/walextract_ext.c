@@ -1163,6 +1163,247 @@ walextract_dmlbatch_stats(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/* ===================== unified MACHINEBATCH (ChangeBatch + ChangeDmlBatch) ===================== */
+
+/*
+ * One scan that carries both families under one xid-family decision: INSERT/COPY
+ * as ChangeBatch and supported UPDATE/DELETE as ChangeDmlBatch.  Both feed one
+ * tuplestore (detail) tagged by `kind`, or one set of stats accumulators.  Any
+ * unsafe user op poisons the whole xid family exactly as in the single modes.
+ */
+typedef struct MachineBatchSinkCtx
+{
+	Tuplestorestate *tupstore;	/* detail mode only */
+	TupleDesc	tupdesc;
+	bool		detail;
+	int64		insert_batches;
+	int64		insert_rows;
+	int64		dml_batches;
+	int64		n_update;
+	int64		n_delete;
+	bool		any_toast;
+	bool		any_incomplete;
+} MachineBatchSinkCtx;
+
+/* detail row column order shared by both callbacks (NULL where not applicable) */
+static void
+machine_put_row(MachineBatchSinkCtx *s, const char *kind, XLogRecPtr record_lsn,
+				XLogRecPtr commit_lsn, TransactionId xid, Oid relfilenode,
+				Oid rel_oid, const char *op, const char *idsrc,
+				bool nrows_null, int32 nrows, bool nident_null, int32 nident,
+				bool hasnew_null, bool has_new_row, bool toast_external,
+				bool incomplete_null, bool incomplete)
+{
+	Datum		values[13];
+	bool		isnull[13];
+
+	memset(isnull, 0, sizeof(isnull));
+	values[0] = CStringGetTextDatum(kind);
+	values[1] = LSNGetDatum(record_lsn);
+	if (commit_lsn == InvalidXLogRecPtr)
+		isnull[2] = true;
+	else
+		values[2] = LSNGetDatum(commit_lsn);
+	values[3] = TransactionIdGetDatum(xid);
+	values[4] = ObjectIdGetDatum(relfilenode);
+	values[5] = ObjectIdGetDatum(rel_oid);
+	if (op == NULL)
+		isnull[6] = true;
+	else
+		values[6] = CStringGetTextDatum(op);
+	if (idsrc == NULL)
+		isnull[7] = true;
+	else
+		values[7] = CStringGetTextDatum(idsrc);
+	if (nrows_null)
+		isnull[8] = true;
+	else
+		values[8] = Int32GetDatum(nrows);
+	if (nident_null)
+		isnull[9] = true;
+	else
+		values[9] = Int32GetDatum(nident);
+	if (hasnew_null)
+		isnull[10] = true;
+	else
+		values[10] = BoolGetDatum(has_new_row);
+	values[11] = BoolGetDatum(toast_external);
+	if (incomplete_null)
+		isnull[12] = true;
+	else
+		values[12] = BoolGetDatum(incomplete);
+	tuplestore_putvalues(s->tupstore, s->tupdesc, values, isnull);
+}
+
+/* INSERT/COPY ChangeBatch -> kind=INSERT_BATCH */
+static void
+machine_insert_sink(const ChangeBatch *b, void *sink)
+{
+	MachineBatchSinkCtx *s = (MachineBatchSinkCtx *) sink;
+
+	s->insert_batches++;
+	s->insert_rows += b->nrows;
+	if (b->has_external_toast)
+		s->any_toast = true;
+	if (s->detail)
+		machine_put_row(s, "INSERT_BATCH", b->record_lsn, b->commit_lsn, b->xid,
+						b->relfilenode, b->rel_oid, NULL, NULL,
+						false, b->nrows, true, 0, true, false,
+						b->has_external_toast, true, false);
+}
+
+/* UPDATE/DELETE ChangeDmlBatch -> kind=DML_BATCH */
+static void
+machine_dml_sink(const ChangeDmlBatch *b, void *sink)
+{
+	MachineBatchSinkCtx *s = (MachineBatchSinkCtx *) sink;
+
+	s->dml_batches++;
+	if (b->op == WCO_UPDATE)
+		s->n_update++;
+	else if (b->op == WCO_DELETE)
+		s->n_delete++;
+	if (b->toast_external)
+		s->any_toast = true;
+	if (b->incomplete)
+		s->any_incomplete = true;
+	if (s->detail)
+		machine_put_row(s, "DML_BATCH", b->record_lsn, b->commit_lsn, b->xid,
+						b->relfilenode, b->rel_oid, walextract_op_name(b->op),
+						b->identity_source == WX_DML_OLD_KEY ? "OLD_KEY" : "OLD_TUPLE",
+						true, 0, false, b->nident, false, b->has_new_row,
+						b->toast_external, false, b->incomplete);
+}
+
+/* shared WAL scan in unified machinebatch mode; fail-closed on stop/poison(stats) */
+static void
+scan_machinebatches(XLogRecPtr start_lsn, XLogRecPtr end_lsn, MachineBatchSinkCtx *ms,
+					bool prime, text *sidecar, int64 *b_peak)
+{
+	XLogReaderState *xlogreader;
+	WalExtractContext *wectx;
+
+	if (!has_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("permission denied to mine WAL"),
+				 errdetail("Only roles with privileges of the \"pg_read_server_files\" role may use this function.")));
+
+	{
+		XLogRecPtr	curr_flush = GetFlushRecPtr(NULL);
+
+		if (end_lsn == InvalidXLogRecPtr || end_lsn > curr_flush)
+			end_lsn = curr_flush;
+	}
+	if (start_lsn > end_lsn)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("start_lsn is greater than end_lsn")));
+
+	wectx = walextract_context_create();
+	if (wectx == NULL)
+		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory")));
+	walextract_set_emit_machinebatch(wectx, machine_insert_sink, ms,
+									 machine_dml_sink, ms);
+	walextract_set_pgdata(wectx, DataDir);
+	walextract_set_bootstrap(wectx, false);
+	walextract_set_target_db(wectx, MyDatabaseId);
+	apply_priming(wectx, prime, sidecar, start_lsn);
+
+	xlogreader = InitXLogReaderState(start_lsn);
+	while (ReadNextXLogRecord(xlogreader) && xlogreader->EndRecPtr <= end_lsn)
+	{
+		CHECK_FOR_INTERRUPTS();
+		walextract_record(wectx, xlogreader);
+		if (walextract_failed(wectx))
+			break;
+	}
+
+	if (walextract_failed(wectx))
+	{
+		const char *msg = walextract_status_message(wectx);
+
+		pfree(xlogreader->private_data);
+		XLogReaderFree(xlogreader);
+		walextract_context_free(wectx);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("walextract machinebatch mode stopped: %s", msg)));
+	}
+
+	/* strict stats is the completeness gate; detail omits poisoned families */
+	if (!ms->detail && walextract_committed_poison(wectx))
+	{
+		const char *msg = walextract_poison_reason(wectx);
+		int64		npoison = walextract_poison_count(wectx);
+
+		pfree(xlogreader->private_data);
+		XLogReaderFree(xlogreader);
+		walextract_context_free(wectx);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("walextract machinebatch mode stopped: %s", msg),
+				 errdetail("%ld poisoned xid %s omitted from this range",
+						   (long) npoison,
+						   npoison == 1 ? "family" : "families")));
+	}
+
+	*b_peak = (int64) walextract_bbuf_peak(wectx);
+	pfree(xlogreader->private_data);
+	XLogReaderFree(xlogreader);
+	walextract_context_free(wectx);
+}
+
+PG_FUNCTION_INFO_V1(walextract_wal2machinebatch);
+Datum
+walextract_wal2machinebatch(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	start_lsn = PG_GETARG_LSN(0);
+	XLogRecPtr	end_lsn = PG_GETARG_LSN(1);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	MachineBatchSinkCtx ms;
+	int64		b_peak;
+
+	InitMaterializedSRF(fcinfo, 0);
+	memset(&ms, 0, sizeof(ms));
+	ms.tupstore = rsinfo->setResult;
+	ms.tupdesc = rsinfo->setDesc;
+	ms.detail = true;
+	scan_machinebatches(start_lsn, end_lsn, &ms, PG_GETARG_BOOL(2),
+						sidecar_arg_or_null(PG_GETARG_TEXT_PP(3)), &b_peak);
+	return (Datum) 0;
+}
+
+PG_FUNCTION_INFO_V1(walextract_machinebatch_stats);
+Datum
+walextract_machinebatch_stats(PG_FUNCTION_ARGS)
+{
+	XLogRecPtr	start_lsn = PG_GETARG_LSN(0);
+	XLogRecPtr	end_lsn = PG_GETARG_LSN(1);
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	MachineBatchSinkCtx ms;
+	int64		b_peak = 0;
+	Datum		values[7];
+	bool		isnull[7];
+
+	InitMaterializedSRF(fcinfo, 0);
+	memset(&ms, 0, sizeof(ms));
+	ms.detail = false;
+	scan_machinebatches(start_lsn, end_lsn, &ms, PG_GETARG_BOOL(2),
+						sidecar_arg_or_null(PG_GETARG_TEXT_PP(3)), &b_peak);
+
+	memset(isnull, 0, sizeof(isnull));
+	values[0] = Int64GetDatum(ms.insert_batches);
+	values[1] = Int64GetDatum(ms.insert_rows);
+	values[2] = Int64GetDatum(ms.dml_batches);
+	values[3] = Int64GetDatum(ms.n_update);
+	values[4] = Int64GetDatum(ms.n_delete);
+	values[5] = BoolGetDatum(ms.any_toast);
+	values[6] = BoolGetDatum(ms.any_incomplete);
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, isnull);
+	return (Datum) 0;
+}
+
 static const char *
 mode_name(WalExtractActiveMode m)
 {
@@ -1174,6 +1415,8 @@ mode_name(WalExtractActiveMode m)
 			return "batch";
 		case WX_MODE_DMLBATCH:
 			return "dmlbatch";
+		case WX_MODE_MACHINEBATCH:
+			return "machinebatch";
 		default:
 			return "none";
 	}

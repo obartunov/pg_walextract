@@ -3490,10 +3490,14 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 	if (ctx->status != WALEXTRACT_OK)
 		return;					/* failed closed: stop processing */
 
-	/* single-active mode invariant: at most one of event/batch/dmlbatch sinks */
+	/*
+	 * Mode invariant: EVENT is mutually exclusive with the machine sinks.  The
+	 * batch and dmlbatch sinks may be installed together -- that is the unified
+	 * MACHINEBATCH mode (INSERT ChangeBatch + UPDATE/DELETE ChangeDmlBatch under
+	 * one xid family).
+	 */
 	Assert(!(ctx->emit_cb && ctx->batch_emit_cb));
 	Assert(!(ctx->emit_cb && ctx->dml_emit_cb));
-	Assert(!(ctx->batch_emit_cb && ctx->dml_emit_cb));
 
 	/*
 	 * Transaction boundary: a COMMIT delivers the transaction's buffered
@@ -3631,7 +3635,7 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		 * INTERNAL/CATALOG fall through to the per-tuple learning path so the
 		 * dictionary keeps mining catalog inserts.
 		 */
-		if (ctx->dml_emit_cb)
+		if (ctx->dml_emit_cb && !ctx->batch_emit_cb)
 		{
 			WalExtractRelTrust trust = we_rel_trust(ctx, rloc.relNumber);
 
@@ -3643,10 +3647,12 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 			if (trust == WX_REL_USER)
 			{
 				/*
-				 * DML-batch mode does not emit inserts; a user INSERT means the
-				 * xid may mix INSERT with UPDATE/DELETE.  2e: poison the family
+				 * Pure DML-batch mode does not emit inserts; a user INSERT means
+				 * the xid may mix INSERT with UPDATE/DELETE.  Poison the family
 				 * so neither part is delivered as a clean apply-safe stream,
-				 * while clean families keep flowing.
+				 * while clean families keep flowing.  In unified MACHINEBATCH
+				 * mode (batch sink also installed) this block is skipped and the
+				 * INSERT is buffered as a ChangeBatch below.
 				 */
 				we_poison_xid(ctx, WEB_DMLBATCH_MIXED_INSERT);
 				return;
@@ -3736,6 +3742,29 @@ walextract_record(WalExtractContext *ctx, XLogReaderState *record)
 		 * dictionary keeps learning.  Single-active mode: when a batch sink is
 		 * registered the event sink is absent, so no tee.
 		 */
+		/*
+		 * Pure DML-batch mode: a user MULTI_INSERT (COPY) is the mixed-insert
+		 * case too -- poison the family so a COPY + supported UPDATE/DELETE xid
+		 * is never delivered as a partial apply-safe stream.  In unified
+		 * MACHINEBATCH mode (batch sink installed) this is skipped and the COPY
+		 * is buffered as a ChangeBatch below.
+		 */
+		if (ctx->dml_emit_cb && !ctx->batch_emit_cb)
+		{
+			WalExtractRelTrust trust = we_rel_trust(ctx, rloc.relNumber);
+
+			if (trust == WX_REL_UNKNOWN)
+			{
+				we_batch_unsupported(ctx, WEB_UNKNOWN_DICTIONARY);
+				return;
+			}
+			if (trust == WX_REL_USER)
+			{
+				we_poison_xid(ctx, WEB_DMLBATCH_MIXED_INSERT);
+				return;
+			}
+			/* INTERNAL/CATALOG: fall through to the catalog-learning path */
+		}
 		if (ctx->batch_emit_cb)
 		{
 			WalExtractRelTrust trust = we_rel_trust(ctx, rloc.relNumber);
@@ -4128,7 +4157,9 @@ walextract_buf_peak(const WalExtractContext *ctx)
 WalExtractActiveMode
 walextract_active_mode(const WalExtractContext *ctx)
 {
-	/* single-active mode is enforced by the setters; report the live sink */
+	/* mode is inferred from the installed sinks (enforced by the setters) */
+	if (ctx->batch_emit_cb != NULL && ctx->dml_emit_cb != NULL)
+		return WX_MODE_MACHINEBATCH;
 	if (ctx->dml_emit_cb != NULL)
 		return WX_MODE_DMLBATCH;
 	if (ctx->batch_emit_cb != NULL)
@@ -4194,6 +4225,27 @@ walextract_set_emit_dmlbatch(WalExtractContext *ctx, WalExtractEmitDmlBatch cb, 
 	ctx->emit_sink = NULL;
 	ctx->batch_emit_cb = NULL;
 	ctx->batch_emit_sink = NULL;
+}
+
+/*
+ * Unified machine mode: both the INSERT/COPY ChangeBatch sink and the
+ * UPDATE/DELETE ChangeDmlBatch sink are installed, so one WAL scan emits both
+ * families under one xid-family decision.  A user INSERT is buffered as a
+ * ChangeBatch (no longer poisons as "mixed insert"); a supported UPDATE/DELETE
+ * is emitted as a ChangeDmlBatch; any unsafe user op still poisons the whole
+ * xid family.  Event mode stays mutually exclusive.
+ */
+void
+walextract_set_emit_machinebatch(WalExtractContext *ctx,
+								 WalExtractEmitBatch bcb, void *bsink,
+								 WalExtractEmitDmlBatch dcb, void *dsink)
+{
+	ctx->batch_emit_cb = bcb;
+	ctx->batch_emit_sink = bsink;
+	ctx->dml_emit_cb = dcb;
+	ctx->dml_emit_sink = dsink;
+	ctx->emit_cb = NULL;
+	ctx->emit_sink = NULL;
 }
 
 void

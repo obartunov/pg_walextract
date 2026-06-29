@@ -269,7 +269,8 @@ typedef enum WalExtractActiveMode
 	WX_MODE_NONE = 0,
 	WX_MODE_EVENT,
 	WX_MODE_BATCH,
-	WX_MODE_DMLBATCH			/* 2c: ChangeDmlBatch (UPDATE/DELETE) machine path */
+	WX_MODE_DMLBATCH,			/* 2c: ChangeDmlBatch (UPDATE/DELETE) machine path */
+	WX_MODE_MACHINEBATCH		/* unified: ChangeBatch + ChangeDmlBatch, one xid family */
 } WalExtractActiveMode;
 
 extern WalExtractContext *walextract_context_create(void);
@@ -285,6 +286,9 @@ extern void walextract_context_reset(WalExtractContext *ctx);
 extern void walextract_set_emit(WalExtractContext *ctx, WalExtractEmit cb, void *sink);
 extern void walextract_set_emit_batch(WalExtractContext *ctx, WalExtractEmitBatch cb, void *sink);
 extern void walextract_set_emit_dmlbatch(WalExtractContext *ctx, WalExtractEmitDmlBatch cb, void *sink);
+extern void walextract_set_emit_machinebatch(WalExtractContext *ctx,
+											 WalExtractEmitBatch bcb, void *bsink,
+											 WalExtractEmitDmlBatch dcb, void *dsink);
 extern WalExtractActiveMode walextract_active_mode(const WalExtractContext *ctx);
 
 /*

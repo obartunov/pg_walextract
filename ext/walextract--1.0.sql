@@ -57,6 +57,33 @@ LANGUAGE C STRICT PARALLEL UNSAFE;
 REVOKE EXECUTE ON FUNCTION walextract_dmlbatch_stats(pg_lsn, pg_lsn, boolean, text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION walextract_dmlbatch_stats(pg_lsn, pg_lsn, boolean, text) TO pg_read_server_files;
 
+-- unified machine apply stream: INSERT/COPY ChangeBatch + UPDATE/DELETE
+-- ChangeDmlBatch from one scan under one xid-family decision.  Detail rows are
+-- tagged by kind (INSERT_BATCH / DML_BATCH); per-kind columns are NULL where not
+-- applicable.
+CREATE FUNCTION walextract_wal2machinebatch(start_lsn pg_lsn, end_lsn pg_lsn, prime boolean DEFAULT false, sidecar text DEFAULT '')
+RETURNS TABLE(kind text, record_lsn pg_lsn, commit_lsn pg_lsn, xid xid,
+              relfilenode oid, rel_oid oid, op text, identity_source text,
+              nrows int, nident int, has_new_row boolean,
+              toast_external boolean, incomplete boolean)
+AS 'MODULE_PATHNAME', 'walextract_wal2machinebatch'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+REVOKE EXECUTE ON FUNCTION walextract_wal2machinebatch(pg_lsn, pg_lsn, boolean, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION walextract_wal2machinebatch(pg_lsn, pg_lsn, boolean, text) TO pg_read_server_files;
+
+-- unified machine apply stream summary (completeness gate; fails closed on a
+-- committed poisoned xid family, errdetail reports the omitted-family count)
+CREATE FUNCTION walextract_machinebatch_stats(start_lsn pg_lsn, end_lsn pg_lsn, prime boolean DEFAULT false, sidecar text DEFAULT '')
+RETURNS TABLE(insert_batches bigint, insert_rows bigint, dml_batches bigint,
+              n_update bigint, n_delete bigint, any_toast_external boolean,
+              any_incomplete boolean)
+AS 'MODULE_PATHNAME', 'walextract_machinebatch_stats'
+LANGUAGE C STRICT PARALLEL UNSAFE;
+
+REVOKE EXECUTE ON FUNCTION walextract_machinebatch_stats(pg_lsn, pg_lsn, boolean, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION walextract_machinebatch_stats(pg_lsn, pg_lsn, boolean, text) TO pg_read_server_files;
+
 -- single-active mode contract selftest (no WAL access; safe for PUBLIC)
 CREATE FUNCTION walextract_mode_selftest()
 RETURNS text
