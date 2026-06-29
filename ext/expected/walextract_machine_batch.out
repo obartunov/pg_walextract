@@ -1,0 +1,105 @@
+-- Unified MACHINEBATCH mode: one scan emits INSERT/COPY ChangeBatch and
+-- UPDATE/DELETE ChangeDmlBatch under one xid-family decision.  These run at the
+-- suite's wal_level (replica), where user UPDATE/DELETE are unsafe (no explicit
+-- old identity) and user INSERT is supported -- so the reachable behaviors are:
+-- INSERT emits, a mixed unsafe xid is fully suppressed (the INSERT does not
+-- leak), a clean xid still emits after a poisoned one, and an aborted mixed xid
+-- leaves no poison.  Supported mixed INSERT + UPDATE/DELETE (both families in
+-- one xid) requires wal_level=logical and is covered by runtime probes.
+-- Output is deterministic: per-kind batch counts and a stable gate token.
+CREATE EXTENSION walextract;
+CREATE FUNCTION mb_kinds(s pg_lsn, e pg_lsn)
+RETURNS TABLE(kind text, n bigint) AS $$
+    SELECT kind, count(*) FROM walextract_wal2machinebatch(s, e, true, '')
+    GROUP BY kind ORDER BY kind
+$$ LANGUAGE sql;
+-- completeness gate: 'clean' or the precise fail-closed reason
+CREATE FUNCTION mb_gate(s pg_lsn, e pg_lsn) RETURNS text AS $$
+BEGIN
+    PERFORM insert_batches FROM walextract_machinebatch_stats(s, e, true, '');
+    RETURN 'clean';
+EXCEPTION WHEN OTHERS THEN
+    RETURN regexp_replace(SQLERRM, '^walextract machinebatch mode stopped: ', '');
+END$$ LANGUAGE plpgsql;
+CREATE TABLE t(id int primary key, v int);
+INSERT INTO t VALUES (1,1),(2,2);
+-- MB1 INSERT-only xid: emits one INSERT_BATCH; gate clean.
+SELECT pg_current_wal_lsn() AS s \gset
+INSERT INTO t VALUES (3,3),(4,4);
+SELECT pg_current_wal_lsn() AS e \gset
+SELECT 'MB1 insert-only' AS case; SELECT * FROM mb_kinds(:'s', :'e');
+      case       
+-----------------
+ MB1 insert-only
+(1 row)
+
+     kind     | n 
+--------------+---
+ INSERT_BATCH | 1
+(1 row)
+
+SELECT 'MB1 gate' AS case, mb_gate(:'s', :'e') AS gate;
+   case   | gate  
+----------+-------
+ MB1 gate | clean
+(1 row)
+
+-- MB2 mixed INSERT + unsafe UPDATE in one xid: nothing emitted (the supported
+-- INSERT is suppressed with the family); gate fails closed with the reason.
+SELECT pg_current_wal_lsn() AS s \gset
+BEGIN; INSERT INTO t VALUES (5,5); UPDATE t SET v = v + 1 WHERE id = 1; COMMIT;
+SELECT pg_current_wal_lsn() AS e \gset
+SELECT 'MB2 mixed insert+unsafe' AS case, count(*) AS rows FROM mb_kinds(:'s', :'e');
+          case           | rows 
+-------------------------+------
+ MB2 mixed insert+unsafe |    0
+(1 row)
+
+SELECT 'MB2 gate' AS case, mb_gate(:'s', :'e') AS gate;
+   case   |          gate          
+----------+------------------------
+ MB2 gate | hot_update_unsupported
+(1 row)
+
+-- MB3 poisoned xid then clean INSERT xid: the clean xid still emits.
+SELECT pg_current_wal_lsn() AS s \gset
+BEGIN; INSERT INTO t VALUES (6,6); UPDATE t SET v = v + 1 WHERE id = 2; COMMIT;
+INSERT INTO t VALUES (7,7);
+SELECT pg_current_wal_lsn() AS e \gset
+SELECT 'MB3 poisoned then clean' AS case; SELECT * FROM mb_kinds(:'s', :'e');
+          case           
+-------------------------
+ MB3 poisoned then clean
+(1 row)
+
+     kind     | n 
+--------------+---
+ INSERT_BATCH | 1
+(1 row)
+
+-- MB4 aborted mixed xid then clean INSERT xid: aborted poison leaves no state,
+-- the clean xid emits, and the gate is clean (no committed poison).
+SELECT pg_current_wal_lsn() AS s \gset
+BEGIN; INSERT INTO t VALUES (8,8); UPDATE t SET v = v + 1 WHERE id = 1; ROLLBACK;
+INSERT INTO t VALUES (9,9);
+SELECT pg_current_wal_lsn() AS e \gset
+SELECT 'MB4 aborted mixed then clean' AS case; SELECT * FROM mb_kinds(:'s', :'e');
+             case             
+------------------------------
+ MB4 aborted mixed then clean
+(1 row)
+
+     kind     | n 
+--------------+---
+ INSERT_BATCH | 1
+(1 row)
+
+SELECT 'MB4 gate' AS case, mb_gate(:'s', :'e') AS gate;
+   case   | gate  
+----------+-------
+ MB4 gate | clean
+(1 row)
+
+DROP FUNCTION mb_kinds(pg_lsn, pg_lsn);
+DROP FUNCTION mb_gate(pg_lsn, pg_lsn);
+DROP EXTENSION walextract;
