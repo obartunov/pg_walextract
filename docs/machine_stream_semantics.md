@@ -37,16 +37,40 @@ DML record is emitted **only** when its old identity is explicit, decoded, and
 safe (see §3). Batches are buffered by xid, flushed on COMMIT, discarded on
 ABORT, and poisoned xid families are suppressed (see §7).
 
+### MACHINEBATCH
+The combined machine mode (`walextract_wal2machinebatch` detail,
+`walextract_machinebatch_stats` strict stats). One scan emits both families
+under **one xid-family safety decision**:
+
+- INSERT/COPY as `ChangeBatch`,
+- supported UPDATE/DELETE as `ChangeDmlBatch`.
+
+A clean mixed transaction emits both `INSERT_BATCH` and `DML_BATCH` rows from the
+same xid; an unsafe mixed transaction emits **no partial apply-safe family** (the
+supported INSERT is suppressed with the poisoned family). This is the mode to use
+when a transaction may mix INSERT/COPY with UPDATE/DELETE -- the separate BATCH
+and DMLBATCH modes each fail closed on the other's records.
+`walextract_machinebatch_stats` is the completeness gate for MACHINEBATCH.
+
 ## 2. SQL / SRF surfaces
 
-    walextract_wal2sql(start_lsn, end_lsn, prime, sidecar)          EVENT detail (SQL/event view)
-    walextract_wal2event_count(start_lsn, end_lsn, prime, sidecar)  EVENT count
-    walextract_wal2batch(start_lsn, end_lsn, prime, sidecar)        BATCH detail (ChangeBatch)
-    walextract_batch_stats(start_lsn, end_lsn, prime, sidecar)      BATCH strict stats / completeness gate
-    walextract_wal2dmlbatch(start_lsn, end_lsn, prime, sidecar)     DMLBATCH detail (ChangeDmlBatch)
-    walextract_dmlbatch_stats(start_lsn, end_lsn, prime, sidecar)   DMLBATCH strict stats / completeness gate
-    walextract_export_dictionary()                                  WX_SIDECAR 2 producer (R/A/I records)
-    walextract_mode_selftest()                                      build/mode self-test
+    walextract_wal2sql(start_lsn, end_lsn, prime, sidecar)            EVENT detail (SQL/event view)
+    walextract_wal2event_count(start_lsn, end_lsn, prime, sidecar)    EVENT count
+    walextract_wal2batch(start_lsn, end_lsn, prime, sidecar)          BATCH detail (ChangeBatch)
+    walextract_batch_stats(start_lsn, end_lsn, prime, sidecar)        BATCH strict stats / completeness gate
+    walextract_wal2dmlbatch(start_lsn, end_lsn, prime, sidecar)       DMLBATCH detail (ChangeDmlBatch)
+    walextract_dmlbatch_stats(start_lsn, end_lsn, prime, sidecar)     DMLBATCH strict stats / completeness gate
+    walextract_wal2machinebatch(start_lsn, end_lsn, prime, sidecar)   MACHINEBATCH detail (kind = INSERT_BATCH / DML_BATCH)
+    walextract_machinebatch_stats(start_lsn, end_lsn, prime, sidecar) MACHINEBATCH strict stats / completeness gate
+    walextract_export_dictionary()                                    WX_SIDECAR 2 producer (R/A/I records)
+    walextract_mode_selftest()                                        build/mode self-test
+
+`walextract_wal2machinebatch` tags each row by `kind` (`INSERT_BATCH` or
+`DML_BATCH`); per-kind columns are NULL where not applicable (`nrows` for an
+INSERT batch; `op`/`identity_source`/`nident`/`has_new_row`/`incomplete` for a
+DML batch). `walextract_machinebatch_stats` returns `insert_batches`,
+`insert_rows`, `dml_batches`, `n_update`, `n_delete`, and the TOAST/incomplete
+flags, and fails closed on a poisoned family like the other strict stats SRFs.
 
 `prime` (boolean) primes the relation/identity dictionary from the live catalog;
 `sidecar` (text) primes it from an exported WX_SIDECAR blob instead (see §6).

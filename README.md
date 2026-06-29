@@ -17,7 +17,7 @@ This is a **physical WAL miner foundation**, not a logical-decoding replacement.
 are used as reference knowledge for record layouts; `walextract` owns the
 structured machine stream and its explicit safety rules.
 
-Three machine modes share one read-only WAL scan:
+Four machine modes share one read-only WAL scan:
 
 - **EVENT** — diagnostic / legacy / forensic per-record view (`walextract_wal2sql`,
   `walextract_wal2event_count`); not a complete apply stream by itself.
@@ -25,6 +25,11 @@ Three machine modes share one read-only WAL scan:
   `walextract_batch_stats`); xid-buffered, COMMIT-flushed, ABORT-discarded.
 - **DMLBATCH** — UPDATE/DELETE `ChangeDmlBatch` (`walextract_wal2dmlbatch`,
   `walextract_dmlbatch_stats`).
+- **MACHINEBATCH** — the combined mode (`walextract_wal2machinebatch`,
+  `walextract_machinebatch_stats`): one scan emits INSERT/COPY `ChangeBatch` and
+  UPDATE/DELETE `ChangeDmlBatch` under one xid-family decision, so a clean mixed
+  transaction emits both `INSERT_BATCH` and `DML_BATCH` rows and an unsafe mixed
+  transaction emits no partial apply-safe family.
 
 Accepted machine stream rules:
 
